@@ -16,7 +16,7 @@ export default defineConfig({
   outDir: "dist-sea",
   outExtension: () => ({ js: ".mjs" }),
   format: ["esm"],
-  target: "node22",
+  target: "node24",
   platform: "node",
   clean: false,
   sourcemap: false,

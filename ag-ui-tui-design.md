@@ -552,7 +552,7 @@ const { stdout } = useStdout();
   "engines": { "node": ">=22" },
   "scripts": {
     "dev": "tsx watch src/entry.tsx",
-    "build": "tsup src/entry.tsx --format esm --target node22 --clean --dts=false",
+    "build": "tsup src/entry.tsx --format esm --target node24 --clean --dts=false",
     "start": "node dist/entry.js",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "pnpm build"
