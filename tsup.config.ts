@@ -20,6 +20,7 @@ export default defineConfig({
     "ink",
     "react",
     "react-devtools-core",
+    "dotenv",
   ],
   banner: {
     js: [

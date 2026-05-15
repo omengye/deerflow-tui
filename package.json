@@ -6,7 +6,9 @@
   "bin": {
     "deerflow-tui": "./dist/entry.js"
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "engines": {
     "node": ">=22"
   },
@@ -27,6 +29,7 @@
     "@assistant-ui/react-ink": "0.0.16",
     "@assistant-ui/react-ink-markdown": "0.0.15",
     "assistant-cloud": "^0.1.27",
+    "dotenv": "^17.4.2",
     "ink": "^7.0.3",
     "react": "^19.2.0",
     "react-devtools-core": "^6.1.2"
@@ -34,13 +37,15 @@
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/react": "^19.0.0",
+    "postject": "^1.0.0-alpha.6",
     "tsup": "^8.3.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.6.0",
-    "postject": "^1.0.0-alpha.6"
+    "typescript": "^5.6.0"
   },
   "packageManager": "pnpm@11.0.9",
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild"]
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   }
 }

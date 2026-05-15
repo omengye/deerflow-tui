@@ -41,13 +41,13 @@ function installFetchPatch() {
   if (g.__deerflowFetchPatched) return;
   g.__deerflowFetchPatched = true;
 
-  const targetUrl = normalizeUrl(process.env.AG_UI_ENDPOINT ?? DEFAULT_ENDPOINT);
   const originalFetch = globalThis.fetch;
 
   type FetchInput = Parameters<typeof fetch>[0];
   type FetchInit = Parameters<typeof fetch>[1];
 
   globalThis.fetch = (async (input: FetchInput, init?: FetchInit) => {
+    const targetUrl = normalizeUrl(process.env.AG_UI_ENDPOINT ?? DEFAULT_ENDPOINT);
     const rawUrl =
       typeof input === "string"
         ? input

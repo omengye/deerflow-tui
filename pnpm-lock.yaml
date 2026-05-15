@@ -23,6 +23,9 @@ importers:
       assistant-cloud:
         specifier: ^0.1.27
         version: 0.1.27
+      dotenv:
+        specifier: ^17.4.2
+        version: 17.4.2
       ink:
         specifier: ^7.0.3
         version: 7.0.3(@types/react@19.2.14)(react-devtools-core@6.1.5)(react@19.2.6)
@@ -763,6 +766,10 @@ packages:
   diff@9.0.0:
     resolution: {integrity: sha512-svtcdpS8CgJyqAjEQIXdb3OjhFVVYjzGAPO8WGCmRbrml64SPw/jJD4GoE98aR7r25A0XcgrK3F02yw9R/vhQw==}
     engines: {node: '>=0.3.1'}
+
+  dotenv@17.4.2:
+    resolution: {integrity: sha512-nI4U3TottKAcAD9LLud4Cb7b2QztQMUEfHbvhTH09bqXTxnSie8WnjPALV/WMCrJZ6UV/qHJ6L03OqO3LcdYZw==}
+    engines: {node: '>=12'}
 
   environment@1.1.0:
     resolution: {integrity: sha512-xUtoPkMggbz0MPyPiIWr1Kp4aeWJjDZ6SMvURhimjdZgsRuDplF5/s9hcgGhyXMhs+6vpnuoiZ2kFiu3FMnS8Q==}
@@ -1786,6 +1793,8 @@ snapshots:
       dequal: 2.0.3
 
   diff@9.0.0: {}
+
+  dotenv@17.4.2: {}
 
   environment@1.1.0: {}
 

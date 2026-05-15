@@ -1,3 +1,5 @@
+import { config as loadDotenv } from "dotenv";
+loadDotenv();
 import { render } from "ink";
 import { App } from "./app.js";
 import type { Instance } from "ink";

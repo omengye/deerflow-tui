@@ -9,6 +9,7 @@ const bundledDependencies = [
   "ink",
   "react",
   "react-devtools-core",
+  "dotenv",
 ];
 
 export default defineConfig({
