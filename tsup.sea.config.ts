@@ -1,0 +1,34 @@
+import { defineConfig } from "tsup";
+
+const bundledDependencies = [
+  "@ag-ui/client",
+  "@assistant-ui/react-ag-ui",
+  "@assistant-ui/react-ink",
+  "@assistant-ui/react-ink-markdown",
+  "assistant-cloud",
+  "ink",
+  "react",
+  "react-devtools-core",
+];
+
+export default defineConfig({
+  entry: ["src/entry.tsx"],
+  outDir: "dist-sea",
+  outExtension: () => ({ js: ".mjs" }),
+  format: ["esm"],
+  target: "node22",
+  platform: "node",
+  clean: false,
+  sourcemap: false,
+  dts: false,
+  splitting: false,
+  shims: false,
+  bundle: true,
+  noExternal: bundledDependencies,
+  banner: {
+    js: [
+      "import { createRequire as __deerflowCreateRequire } from 'node:module';",
+      "const require = __deerflowCreateRequire(process.execPath);",
+    ].join("\n"),
+  },
+});

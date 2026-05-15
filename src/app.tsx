@@ -1,0 +1,37 @@
+import { Box, Text } from "ink";
+import {
+  AssistantRuntimeProvider,
+  ThreadPrimitive,
+} from "@assistant-ui/react-ink";
+import { useAgentRuntime } from "./runtime/agent-runtime.js";
+import { Message } from "./components/chat/Message.js";
+import { InputBar } from "./components/composer/InputBar.js";
+import { StatusBar } from "./components/panels/StatusBar.js";
+
+export function App() {
+  const runtime = useAgentRuntime();
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <Box flexDirection="column" paddingX={1}>
+        <Box marginBottom={1}>
+          <Text bold color="cyan">deerflow-tui</Text>
+          <Text dimColor> - AG-UI terminal client (Phase 0 spike)</Text>
+        </Box>
+
+        <ThreadPrimitive.Root flexDirection="column">
+          <ThreadPrimitive.Empty>
+            <Box marginY={1}>
+              <Text dimColor>(No messages yet. Type to start.)</Text>
+            </Box>
+          </ThreadPrimitive.Empty>
+
+          <ThreadPrimitive.Messages components={{ Message }} />
+        </ThreadPrimitive.Root>
+
+        <InputBar />
+        <StatusBar />
+      </Box>
+    </AssistantRuntimeProvider>
+  );
+}

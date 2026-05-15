@@ -1,0 +1,8 @@
+{
+  "main": "scripts/sea-bootstrap.cjs",
+  "output": "dist-sea/deerflow-tui.blob",
+  "assets": {
+    "entry.mjs": "dist-sea/entry.mjs"
+  },
+  "disableExperimentalSEAWarning": true
+}
