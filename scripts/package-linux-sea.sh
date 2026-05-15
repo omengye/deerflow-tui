@@ -4,7 +4,7 @@ set -euo pipefail
 OUT_DIR="${OUT_DIR:-dist-sea}"
 BIN_NAME="${BIN_NAME:-deerflow-tui}"
 
-NODE_PATH="$(command -v node)"
+NODE_PATH="${NODE_BIN:-$(command -v node)}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_DIR="${ROOT_DIR}/${OUT_DIR}"
 TARGET_BIN="${TARGET_DIR}/${BIN_NAME}"
