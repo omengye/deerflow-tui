@@ -9,7 +9,7 @@ export default defineConfig({
   sourcemap: true,
   dts: false,
   splitting: false,
-  shims: false,
+  shims: true,
   bundle: true,
   noExternal: [
     "@ag-ui/client",
@@ -22,6 +22,10 @@ export default defineConfig({
     "react-devtools-core",
   ],
   banner: {
-    js: "#!/usr/bin/env node",
+    js: [
+      "#!/usr/bin/env node",
+      "import { createRequire as __deerflowCreateRequire } from 'node:module';",
+      "const require = __deerflowCreateRequire(import.meta.url);",
+    ].join("\n"),
   },
 });
