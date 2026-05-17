@@ -5,7 +5,7 @@ settings:
   excludeLinksFromLockfile: false
 
 patchedDependencies:
-  '@assistant-ui/react-ag-ui@0.0.30': 0d9d5dbd90c48e1baa36f875110ed0eace78b2b9663c6b81662695a46b9c1b08
+  '@assistant-ui/react-ag-ui@0.0.30': dd14ec59f302821c7de7b17f84f7d9b8d070bc9f63077f1eede2d6ae996a7742
 
 importers:
 
@@ -16,7 +16,7 @@ importers:
         version: 0.0.53
       '@assistant-ui/react-ag-ui':
         specifier: 0.0.30
-        version: 0.0.30(patch_hash=0d9d5dbd90c48e1baa36f875110ed0eace78b2b9663c6b81662695a46b9c1b08)(@assistant-ui/store@0.2.10(@assistant-ui/tap@0.5.11(@types/react@19.2.14)(react@19.2.6))(@types/react@19.2.14)(react@19.2.6))(@assistant-ui/tap@0.5.11(@types/react@19.2.14)(react@19.2.6))(@types/react@19.2.14)(assistant-cloud@0.1.27)(react@19.2.6)(zustand@5.0.13(@types/react@19.2.14)(react@19.2.6))
+        version: 0.0.30(patch_hash=dd14ec59f302821c7de7b17f84f7d9b8d070bc9f63077f1eede2d6ae996a7742)(@assistant-ui/store@0.2.10(@assistant-ui/tap@0.5.11(@types/react@19.2.14)(react@19.2.6))(@types/react@19.2.14)(react@19.2.6))(@assistant-ui/tap@0.5.11(@types/react@19.2.14)(react@19.2.6))(@types/react@19.2.14)(assistant-cloud@0.1.27)(react@19.2.6)(zustand@5.0.13(@types/react@19.2.14)(react@19.2.6))
       '@assistant-ui/react-ink':
         specifier: 0.0.16
         version: 0.0.16(@types/react@19.2.14)(assistant-cloud@0.1.27)(ink@7.0.3(@types/react@19.2.14)(react-devtools-core@6.1.5)(react@19.2.6))(react@19.2.6)
@@ -1373,7 +1373,7 @@ snapshots:
       - ioredis
       - redis
 
-  '@assistant-ui/react-ag-ui@0.0.30(patch_hash=0d9d5dbd90c48e1baa36f875110ed0eace78b2b9663c6b81662695a46b9c1b08)(@assistant-ui/store@0.2.10(@assistant-ui/tap@0.5.11(@types/react@19.2.14)(react@19.2.6))(@types/react@19.2.14)(react@19.2.6))(@assistant-ui/tap@0.5.11(@types/react@19.2.14)(react@19.2.6))(@types/react@19.2.14)(assistant-cloud@0.1.27)(react@19.2.6)(zustand@5.0.13(@types/react@19.2.14)(react@19.2.6))':
+  '@assistant-ui/react-ag-ui@0.0.30(patch_hash=dd14ec59f302821c7de7b17f84f7d9b8d070bc9f63077f1eede2d6ae996a7742)(@assistant-ui/store@0.2.10(@assistant-ui/tap@0.5.11(@types/react@19.2.14)(react@19.2.6))(@types/react@19.2.14)(react@19.2.6))(@assistant-ui/tap@0.5.11(@types/react@19.2.14)(react@19.2.6))(@types/react@19.2.14)(assistant-cloud@0.1.27)(react@19.2.6)(zustand@5.0.13(@types/react@19.2.14)(react@19.2.6))':
     dependencies:
       '@ag-ui/client': 0.0.53
       '@assistant-ui/core': 0.2.2(@assistant-ui/store@0.2.10(@assistant-ui/tap@0.5.11(@types/react@19.2.14)(react@19.2.6))(@types/react@19.2.14)(react@19.2.6))(@assistant-ui/tap@0.5.11(@types/react@19.2.14)(react@19.2.6))(@types/react@19.2.14)(assistant-cloud@0.1.27)(react@19.2.6)(zustand@5.0.13(@types/react@19.2.14)(react@19.2.6))

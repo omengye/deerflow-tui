@@ -1,13 +1,15 @@
 diff --git a/dist/runtime/adapter/run-aggregator.js b/dist/runtime/adapter/run-aggregator.js
-index 8eeac1538a348086007f667543bcc60334a693d2..2aafb32929f292434da861d251e63b0ce502ded3 100644
+index 8eeac1538a348086007f667543bcc60334a693d2..2dd4260cde912c4a18dfcce548dd2bb0551d6e24 100644
 --- a/dist/runtime/adapter/run-aggregator.js
 +++ b/dist/runtime/adapter/run-aggregator.js
-@@ -15,12 +15,12 @@ export class RunAggregator {
+@@ -15,12 +15,14 @@ export class RunAggregator {
      interrupts;
      textParts = new Map();
      activeTextMessageId;
 -    reasoningBuffer = "";
 -    reasoningActive = false;
++    completedTextMessageIds = new Set();
++    ignoredTextMessageIds = new Set();
 +    reasoningParts = new Map();
 +    activeReasoningId;
      toolCalls = new Map();
@@ -18,12 +20,14 @@ index 8eeac1538a348086007f667543bcc60334a693d2..2aafb32929f292434da861d251e63b0c
      serverMessageIdReported = false;
      constructor(options) {
          this.emitUpdate = options.emit;
-@@ -32,13 +32,13 @@ export class RunAggregator {
+@@ -32,13 +34,15 @@ export class RunAggregator {
          switch (event.type) {
              case "RUN_STARTED": {
                  this.clearTextParts();
 -                this.reasoningBuffer = "";
 -                this.reasoningActive = false;
++                this.completedTextMessageIds.clear();
++                this.ignoredTextMessageIds.clear();
 +                this.reasoningParts.clear();
                  this.toolCalls.clear();
                  this.partOrder.length = 0;
@@ -35,7 +39,39 @@ index 8eeac1538a348086007f667543bcc60334a693d2..2aafb32929f292434da861d251e63b0c
                  this.interrupts = undefined;
                  this.serverMessageIdReported = false;
                  this.status = { type: "running" };
-@@ -107,17 +107,17 @@ export class RunAggregator {
+@@ -77,6 +81,8 @@ export class RunAggregator {
+             }
+             case "TEXT_MESSAGE_START": {
+                 this.reportServerMessageId(event.messageId);
++                if (this.shouldIgnoreTextMessageStart(event.messageId))
++                    break;
+                 const id = this.startTextMessage(event.messageId);
+                 if (id) {
+                     this.markTextPartTouched(id);
+@@ -88,6 +94,8 @@ export class RunAggregator {
+             case "TEXT_MESSAGE_CHUNK": {
+                 const incomingId = "messageId" in event ? event.messageId : undefined;
+                 this.reportServerMessageId(incomingId);
++                if (this.shouldIgnoreTextMessageContent(incomingId))
++                    break;
+                 if (!event.delta)
+                     break;
+                 const id = this.resolveTextMessageId(incomingId);
+@@ -97,6 +105,13 @@ export class RunAggregator {
+             }
+             case "TEXT_MESSAGE_END": {
+                 this.reportServerMessageId(event.messageId);
++                if (event.messageId && this.ignoredTextMessageIds.has(event.messageId)) {
++                    this.ignoredTextMessageIds.delete(event.messageId);
++                    break;
++                }
++                if (event.messageId) {
++                    this.completedTextMessageIds.add(event.messageId);
++                }
+                 if (event.messageId && this.activeTextMessageId === event.messageId) {
+                     this.activeTextMessageId = undefined;
+                 }
+@@ -107,17 +122,17 @@ export class RunAggregator {
              case "THINKING_TEXT_MESSAGE_START":
              case "REASONING_START":
              case "REASONING_MESSAGE_START":
@@ -56,7 +92,37 @@ index 8eeac1538a348086007f667543bcc60334a693d2..2aafb32929f292434da861d251e63b0c
                  break;
              case "TOOL_CALL_START": {
                  this.reportServerMessageId(event.parentMessageId);
-@@ -280,11 +280,17 @@ export class RunAggregator {
+@@ -163,6 +178,29 @@ export class RunAggregator {
+         this.textPartCounter += 1;
+         return `text-${this.textPartCounter}`;
+     }
++    shouldIgnoreTextMessageStart(messageId) {
++        if (!messageId)
++            return false;
++        if (!this.completedTextMessageIds.has(messageId))
++            return false;
++        this.ignoredTextMessageIds.add(messageId);
++        this.logger.debug?.("[agui] ignoring duplicate TEXT_MESSAGE sequence", {
++            messageId,
++        });
++        return true;
++    }
++    shouldIgnoreTextMessageContent(messageId) {
++        if (!messageId)
++            return false;
++        if (this.ignoredTextMessageIds.has(messageId))
++            return true;
++        if (!this.completedTextMessageIds.has(messageId))
++            return false;
++        this.logger.debug?.("[agui] ignoring duplicate TEXT_MESSAGE content", {
++            messageId,
++        });
++        return true;
++    }
+     startTextMessage(messageId) {
+         const id = messageId ?? this.generateTextKey();
+         this.ensureTextPart(id);
+@@ -280,11 +318,17 @@ export class RunAggregator {
          const snapshot = [];
          for (const part of this.partOrder) {
              if (part.kind === "reasoning") {
@@ -76,7 +142,7 @@ index 8eeac1538a348086007f667543bcc60334a693d2..2aafb32929f292434da861d251e63b0c
                      });
                  }
                  continue;
-@@ -331,37 +337,84 @@ export class RunAggregator {
+@@ -331,37 +375,84 @@ export class RunAggregator {
          };
          this.emitUpdate(result);
      }
@@ -175,7 +241,7 @@ index 8eeac1538a348086007f667543bcc60334a693d2..2aafb32929f292434da861d251e63b0c
  }
  //# sourceMappingURL=run-aggregator.js.map
 diff --git a/src/runtime/adapter/run-aggregator.ts b/src/runtime/adapter/run-aggregator.ts
-index 9967c0bb077c91f87c64d6e33dc815e654987b62..411660255b9ad6ea6f23bd139e3a47770cb27e5a 100644
+index 9967c0bb077c91f87c64d6e33dc815e654987b62..ba9ceb089ecee7c364508c7a0c580c1cf32f0d49 100644
 --- a/src/runtime/adapter/run-aggregator.ts
 +++ b/src/runtime/adapter/run-aggregator.ts
 @@ -27,6 +27,13 @@ type ToolCallState = {
@@ -192,12 +258,14 @@ index 9967c0bb077c91f87c64d6e33dc815e654987b62..411660255b9ad6ea6f23bd139e3a4777
  export type RunAggregatorOptions = {
    showThinking: boolean;
    logger: Logger;
-@@ -53,16 +60,16 @@ export class RunAggregator {
+@@ -53,16 +60,18 @@ export class RunAggregator {
      { buffer: string; touched: boolean }
    >();
    private activeTextMessageId: string | undefined;
 -  private reasoningBuffer = "";
 -  private reasoningActive = false;
++  private readonly completedTextMessageIds = new Set<string>();
++  private readonly ignoredTextMessageIds = new Set<string>();
 +  private readonly reasoningParts = new Map<string, ReasoningState>();
 +  private activeReasoningId: string | undefined;
    private readonly toolCalls = new Map<string, ToolCallState>();
@@ -213,12 +281,14 @@ index 9967c0bb077c91f87c64d6e33dc815e654987b62..411660255b9ad6ea6f23bd139e3a4777
    private serverMessageIdReported = false;
  
    constructor(options: RunAggregatorOptions) {
-@@ -76,13 +83,13 @@ export class RunAggregator {
+@@ -76,13 +85,15 @@ export class RunAggregator {
      switch (event.type) {
        case "RUN_STARTED": {
          this.clearTextParts();
 -        this.reasoningBuffer = "";
 -        this.reasoningActive = false;
++        this.completedTextMessageIds.clear();
++        this.ignoredTextMessageIds.clear();
 +        this.reasoningParts.clear();
          this.toolCalls.clear();
          this.partOrder.length = 0;
@@ -230,7 +300,37 @@ index 9967c0bb077c91f87c64d6e33dc815e654987b62..411660255b9ad6ea6f23bd139e3a4777
          this.interrupts = undefined;
          this.serverMessageIdReported = false;
          this.status = { type: "running" };
-@@ -156,17 +163,17 @@ export class RunAggregator {
+@@ -126,6 +137,7 @@ export class RunAggregator {
+ 
+       case "TEXT_MESSAGE_START": {
+         this.reportServerMessageId(event.messageId);
++        if (this.shouldIgnoreTextMessageStart(event.messageId)) break;
+         const id = this.startTextMessage(event.messageId);
+         if (id) {
+           this.markTextPartTouched(id);
+@@ -137,6 +149,7 @@ export class RunAggregator {
+       case "TEXT_MESSAGE_CHUNK": {
+         const incomingId = "messageId" in event ? event.messageId : undefined;
+         this.reportServerMessageId(incomingId);
++        if (this.shouldIgnoreTextMessageContent(incomingId)) break;
+         if (!event.delta) break;
+         const id = this.resolveTextMessageId(incomingId);
+         this.appendText(id, event.delta);
+@@ -145,6 +158,13 @@ export class RunAggregator {
+       }
+       case "TEXT_MESSAGE_END": {
+         this.reportServerMessageId(event.messageId);
++        if (event.messageId && this.ignoredTextMessageIds.has(event.messageId)) {
++          this.ignoredTextMessageIds.delete(event.messageId);
++          break;
++        }
++        if (event.messageId) {
++          this.completedTextMessageIds.add(event.messageId);
++        }
+         if (event.messageId && this.activeTextMessageId === event.messageId) {
+           this.activeTextMessageId = undefined;
+         }
+@@ -156,17 +176,17 @@ export class RunAggregator {
        case "THINKING_TEXT_MESSAGE_START":
        case "REASONING_START":
        case "REASONING_MESSAGE_START":
@@ -251,7 +351,34 @@ index 9967c0bb077c91f87c64d6e33dc815e654987b62..411660255b9ad6ea6f23bd139e3a4777
          break;
  
        case "TOOL_CALL_START": {
-@@ -364,14 +371,25 @@ export class RunAggregator {
+@@ -225,6 +245,26 @@ export class RunAggregator {
+     return `text-${this.textPartCounter}`;
+   }
+ 
++  private shouldIgnoreTextMessageStart(messageId?: string): boolean {
++    if (!messageId) return false;
++    if (!this.completedTextMessageIds.has(messageId)) return false;
++    this.ignoredTextMessageIds.add(messageId);
++    this.logger.debug?.("[agui] ignoring duplicate TEXT_MESSAGE sequence", {
++      messageId,
++    });
++    return true;
++  }
++
++  private shouldIgnoreTextMessageContent(messageId?: string): boolean {
++    if (!messageId) return false;
++    if (this.ignoredTextMessageIds.has(messageId)) return true;
++    if (!this.completedTextMessageIds.has(messageId)) return false;
++    this.logger.debug?.("[agui] ignoring duplicate TEXT_MESSAGE content", {
++      messageId,
++    });
++    return true;
++  }
++
+   private startTextMessage(messageId?: string): string {
+     const id = messageId ?? this.generateTextKey();
+     this.ensureTextPart(id);
+@@ -364,14 +404,25 @@ export class RunAggregator {
  
      for (const part of this.partOrder) {
        if (part.kind === "reasoning") {
@@ -280,7 +407,7 @@ index 9967c0bb077c91f87c64d6e33dc815e654987b62..411660255b9ad6ea6f23bd139e3a4777
          }
          continue;
        }
-@@ -420,34 +438,99 @@ export class RunAggregator {
+@@ -420,34 +471,99 @@ export class RunAggregator {
      this.emitUpdate(result);
    }
  

@@ -61,7 +61,9 @@ function installFetchPatch() {
     const contentType = response.headers.get("content-type") ?? "";
     if (!contentType.includes("event-stream")) return response;
 
-    return new Response(rewriteSseRoles(response.body), {
+    const ignoredTextMessageIds = getHistoricalAssistantMessageIds(init?.body);
+
+    return new Response(rewriteSseStream(response.body, ignoredTextMessageIds), {
       status: response.status,
       statusText: response.statusText,
       headers: cloneStreamHeaders(response.headers),
@@ -71,7 +73,10 @@ function installFetchPatch() {
 
 installFetchPatch();
 
-function rewriteSseRoles(body: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+function rewriteSseStream(
+  body: ReadableStream<Uint8Array>,
+  ignoredTextMessageIds: ReadonlySet<string>,
+): ReadableStream<Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffer = "";
@@ -83,7 +88,10 @@ function rewriteSseRoles(body: ReadableStream<Uint8Array>): ReadableStream<Uint8
 
       while (idx !== -1) {
         const eventText = buffer.slice(0, idx.eventEnd);
-        controller.enqueue(encoder.encode(`${rewriteSseEvent(eventText)}\n\n`));
+        const rewritten = rewriteSseEvent(eventText, ignoredTextMessageIds);
+        if (rewritten !== undefined) {
+          controller.enqueue(encoder.encode(`${rewritten}\n\n`));
+        }
         buffer = buffer.slice(idx.nextEventStart);
         idx = findSseEventBoundary(buffer);
       }
@@ -92,7 +100,10 @@ function rewriteSseRoles(body: ReadableStream<Uint8Array>): ReadableStream<Uint8
       const tail = decoder.decode();
       if (tail) buffer += tail;
       if (buffer.length > 0) {
-        controller.enqueue(encoder.encode(rewriteSseEvent(buffer)));
+        const rewritten = rewriteSseEvent(buffer, ignoredTextMessageIds);
+        if (rewritten !== undefined) {
+          controller.enqueue(encoder.encode(rewritten));
+        }
         buffer = "";
       }
     },
@@ -119,7 +130,10 @@ function cloneStreamHeaders(headers: Headers): Headers {
   return cloned;
 }
 
-function rewriteSseEvent(eventText: string): string {
+function rewriteSseEvent(
+  eventText: string,
+  ignoredTextMessageIds: ReadonlySet<string>,
+): string | undefined {
   const lines = eventText.split(/\r?\n/);
   const dataLineIndexes: number[] = [];
   const dataParts: string[] = [];
@@ -136,7 +150,9 @@ function rewriteSseEvent(eventText: string): string {
   if (dataLineIndexes.length === 0) return eventText;
 
   const data = dataParts.join("\n");
-  const rewritten = rewriteJsonData(data);
+  const rewritten = rewriteJsonData(data, ignoredTextMessageIds);
+
+  if (rewritten === undefined) return undefined;
 
   if (rewritten === data) return eventText;
 
@@ -150,13 +166,58 @@ function rewriteSseEvent(eventText: string): string {
   return rewrittenLines.join(eventText.includes("\r\n") ? "\r\n" : "\n");
 }
 
-function rewriteJsonData(data: string): string {
+function rewriteJsonData(
+  data: string,
+  ignoredTextMessageIds: ReadonlySet<string>,
+): string | undefined {
   try {
     const parsed = JSON.parse(data) as unknown;
+    if (shouldDropHistoricalTextMessageEvent(parsed, ignoredTextMessageIds)) {
+      return undefined;
+    }
     const rewritten = normalizeAgUiRoles(parsed);
     return rewritten.changed ? JSON.stringify(rewritten.value) : data;
   } catch {
     return data;
+  }
+}
+
+function shouldDropHistoricalTextMessageEvent(
+  value: unknown,
+  ignoredTextMessageIds: ReadonlySet<string>,
+): boolean {
+  if (ignoredTextMessageIds.size === 0 || !isRecord(value)) return false;
+  if (
+    value.type !== "TEXT_MESSAGE_START" &&
+    value.type !== "TEXT_MESSAGE_CONTENT" &&
+    value.type !== "TEXT_MESSAGE_CHUNK" &&
+    value.type !== "TEXT_MESSAGE_END"
+  ) {
+    return false;
+  }
+
+  return (
+    typeof value.messageId === "string" &&
+    ignoredTextMessageIds.has(value.messageId)
+  );
+}
+
+function getHistoricalAssistantMessageIds(body: unknown): Set<string> {
+  if (typeof body !== "string") return new Set();
+
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    if (!isRecord(parsed) || !Array.isArray(parsed.messages)) return new Set();
+
+    const ids = parsed.messages
+      .filter((message): message is Record<string, unknown> => isRecord(message))
+      .filter((message) => message.role === "assistant")
+      .map((message) => message.id)
+      .filter((id): id is string => typeof id === "string" && id.length > 0);
+
+    return new Set(ids);
+  } catch {
+    return new Set();
   }
 }
 
