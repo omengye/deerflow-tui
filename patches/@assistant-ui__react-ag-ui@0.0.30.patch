@@ -1,0 +1,395 @@
+diff --git a/dist/runtime/adapter/run-aggregator.js b/dist/runtime/adapter/run-aggregator.js
+index 8eeac1538a348086007f667543bcc60334a693d2..2aafb32929f292434da861d251e63b0ce502ded3 100644
+--- a/dist/runtime/adapter/run-aggregator.js
++++ b/dist/runtime/adapter/run-aggregator.js
+@@ -15,12 +15,12 @@ export class RunAggregator {
+     interrupts;
+     textParts = new Map();
+     activeTextMessageId;
+-    reasoningBuffer = "";
+-    reasoningActive = false;
++    reasoningParts = new Map();
++    activeReasoningId;
+     toolCalls = new Map();
+     partOrder = [];
+-    hasReasoningPart = false;
+     textPartCounter = 0;
++    reasoningPartCounter = 0;
+     serverMessageIdReported = false;
+     constructor(options) {
+         this.emitUpdate = options.emit;
+@@ -32,13 +32,13 @@ export class RunAggregator {
+         switch (event.type) {
+             case "RUN_STARTED": {
+                 this.clearTextParts();
+-                this.reasoningBuffer = "";
+-                this.reasoningActive = false;
++                this.reasoningParts.clear();
+                 this.toolCalls.clear();
+                 this.partOrder.length = 0;
+-                this.hasReasoningPart = false;
+                 this.textPartCounter = 0;
++                this.reasoningPartCounter = 0;
+                 this.activeTextMessageId = undefined;
++                this.activeReasoningId = undefined;
+                 this.interrupts = undefined;
+                 this.serverMessageIdReported = false;
+                 this.status = { type: "running" };
+@@ -107,17 +107,17 @@ export class RunAggregator {
+             case "THINKING_TEXT_MESSAGE_START":
+             case "REASONING_START":
+             case "REASONING_MESSAGE_START":
+-                this.handleReasoningStart();
++                this.handleReasoningStart(event);
+                 break;
+             case "THINKING_TEXT_MESSAGE_CONTENT":
+             case "REASONING_MESSAGE_CONTENT":
+-                this.handleReasoningContent(event.delta);
++                this.handleReasoningContent(event);
+                 break;
+             case "THINKING_TEXT_MESSAGE_END":
+             case "THINKING_END":
+             case "REASONING_MESSAGE_END":
+             case "REASONING_END":
+-                this.handleReasoningEnd();
++                this.handleReasoningEnd(event);
+                 break;
+             case "TOOL_CALL_START": {
+                 this.reportServerMessageId(event.parentMessageId);
+@@ -280,11 +280,17 @@ export class RunAggregator {
+         const snapshot = [];
+         for (const part of this.partOrder) {
+             if (part.kind === "reasoning") {
++                const entry = this.reasoningParts.get(part.key);
+                 if (this.showThinking &&
+-                    (this.reasoningActive || this.reasoningBuffer.length > 0)) {
++                    entry &&
++                    (entry.active || entry.buffer.length > 0)) {
+                     snapshot.push({
+                         type: "reasoning",
+-                        text: this.reasoningBuffer,
++                        text: entry.buffer,
++                        unstable_agui: {
++                            eventType: entry.eventType,
++                            messageId: entry.messageId ?? part.key,
++                        },
+                     });
+                 }
+                 continue;
+@@ -331,37 +337,84 @@ export class RunAggregator {
+         };
+         this.emitUpdate(result);
+     }
+-    handleReasoningStart() {
++    handleReasoningStart(event) {
+         if (!this.showThinking)
+             return;
+-        this.reasoningActive = true;
+-        this.ensureReasoningPart();
++        const id = this.resolveReasoningId(event);
++        const entry = this.reasoningParts.get(id);
++        if (entry) {
++            entry.active = true;
++        }
+         this.emit();
+     }
+-    handleReasoningContent(delta) {
+-        if (!this.showThinking || !delta)
++    handleReasoningContent(event) {
++        if (!this.showThinking || !event.delta)
+             return;
+-        this.reasoningBuffer += delta;
+-        this.ensureReasoningPart();
++        const id = this.resolveReasoningId(event);
++        const entry = this.reasoningParts.get(id);
++        if (entry) {
++            entry.buffer += event.delta;
++        }
+         this.emit();
+     }
+-    handleReasoningEnd() {
++    handleReasoningEnd(event) {
+         if (!this.showThinking)
+             return;
++        const id = this.resolveReasoningId(event);
++        const entry = this.reasoningParts.get(id);
++        if (entry) {
++            entry.active = false;
++        }
++        if (this.activeReasoningId === id) {
++            this.activeReasoningId = undefined;
++        }
+         this.emit();
+     }
+-    ensureReasoningPart() {
+-        if (this.hasReasoningPart)
++    resolveReasoningId(event) {
++        const messageId = "messageId" in event ? event.messageId : undefined;
++        const eventType = event.type.startsWith("REASONING")
++            ? "REASONING"
++            : "THINKING";
++        if (messageId) {
++            this.ensureReasoningPart(messageId, eventType, messageId);
++            this.activeReasoningId = messageId;
++            return messageId;
++        }
++        if (this.activeReasoningId) {
++            return this.activeReasoningId;
++        }
++        const generated = this.generateReasoningKey(eventType);
++        this.ensureReasoningPart(generated, eventType);
++        this.activeReasoningId = generated;
++        return generated;
++    }
++    generateReasoningKey(eventType) {
++        this.reasoningPartCounter += 1;
++        return `${eventType.toLowerCase()}-${this.reasoningPartCounter}`;
++    }
++    ensureReasoningPart(id, eventType, messageId) {
++        const existing = this.reasoningParts.get(id);
++        if (existing) {
++            existing.eventType = eventType;
++            if (messageId) {
++                existing.messageId = messageId;
++            }
+             return;
++        }
++        this.reasoningParts.set(id, {
++            buffer: "",
++            active: false,
++            eventType,
++            ...(messageId ? { messageId } : {}),
++        });
+         // ensure reasoning appears before the first text segment if possible
+         const textIndex = this.partOrder.findIndex((part) => part.kind === "text");
+         if (textIndex === -1) {
+-            this.partOrder.push({ kind: "reasoning" });
++            this.partOrder.push({ kind: "reasoning", key: id });
+         }
+         else {
+-            this.partOrder.splice(textIndex, 0, { kind: "reasoning" });
++            this.partOrder.splice(textIndex, 0, { kind: "reasoning", key: id });
+         }
+-        this.hasReasoningPart = true;
+     }
+ }
+ //# sourceMappingURL=run-aggregator.js.map
+diff --git a/src/runtime/adapter/run-aggregator.ts b/src/runtime/adapter/run-aggregator.ts
+index 9967c0bb077c91f87c64d6e33dc815e654987b62..411660255b9ad6ea6f23bd139e3a47770cb27e5a 100644
+--- a/src/runtime/adapter/run-aggregator.ts
++++ b/src/runtime/adapter/run-aggregator.ts
+@@ -27,6 +27,13 @@ type ToolCallState = {
+   toolMessageId?: string;
+ };
+ 
++type ReasoningState = {
++  buffer: string;
++  active: boolean;
++  eventType: "REASONING" | "THINKING";
++  messageId?: string;
++};
++
+ export type RunAggregatorOptions = {
+   showThinking: boolean;
+   logger: Logger;
+@@ -53,16 +60,16 @@ export class RunAggregator {
+     { buffer: string; touched: boolean }
+   >();
+   private activeTextMessageId: string | undefined;
+-  private reasoningBuffer = "";
+-  private reasoningActive = false;
++  private readonly reasoningParts = new Map<string, ReasoningState>();
++  private activeReasoningId: string | undefined;
+   private readonly toolCalls = new Map<string, ToolCallState>();
+   private readonly partOrder: (
+     | { kind: "text"; key: string }
+-    | { kind: "reasoning" }
++    | { kind: "reasoning"; key: string }
+     | { kind: "tool-call"; toolCallId: string }
+   )[] = [];
+-  private hasReasoningPart = false;
+   private textPartCounter = 0;
++  private reasoningPartCounter = 0;
+   private serverMessageIdReported = false;
+ 
+   constructor(options: RunAggregatorOptions) {
+@@ -76,13 +83,13 @@ export class RunAggregator {
+     switch (event.type) {
+       case "RUN_STARTED": {
+         this.clearTextParts();
+-        this.reasoningBuffer = "";
+-        this.reasoningActive = false;
++        this.reasoningParts.clear();
+         this.toolCalls.clear();
+         this.partOrder.length = 0;
+-        this.hasReasoningPart = false;
+         this.textPartCounter = 0;
++        this.reasoningPartCounter = 0;
+         this.activeTextMessageId = undefined;
++        this.activeReasoningId = undefined;
+         this.interrupts = undefined;
+         this.serverMessageIdReported = false;
+         this.status = { type: "running" };
+@@ -156,17 +163,17 @@ export class RunAggregator {
+       case "THINKING_TEXT_MESSAGE_START":
+       case "REASONING_START":
+       case "REASONING_MESSAGE_START":
+-        this.handleReasoningStart();
++        this.handleReasoningStart(event);
+         break;
+       case "THINKING_TEXT_MESSAGE_CONTENT":
+       case "REASONING_MESSAGE_CONTENT":
+-        this.handleReasoningContent(event.delta);
++        this.handleReasoningContent(event);
+         break;
+       case "THINKING_TEXT_MESSAGE_END":
+       case "THINKING_END":
+       case "REASONING_MESSAGE_END":
+       case "REASONING_END":
+-        this.handleReasoningEnd();
++        this.handleReasoningEnd(event);
+         break;
+ 
+       case "TOOL_CALL_START": {
+@@ -364,14 +371,25 @@ export class RunAggregator {
+ 
+     for (const part of this.partOrder) {
+       if (part.kind === "reasoning") {
++        const entry = this.reasoningParts.get(part.key);
+         if (
++          entry &&
+           this.showThinking &&
+-          (this.reasoningActive || this.reasoningBuffer.length > 0)
++          (entry.active || entry.buffer.length > 0)
+         ) {
+           snapshot.push({
+             type: "reasoning",
+-            text: this.reasoningBuffer,
+-          } as const);
++            text: entry.buffer,
++            unstable_agui: {
++              eventType: entry.eventType,
++              messageId: entry.messageId ?? part.key,
++            },
++          } as ThreadAssistantMessagePart & {
++            unstable_agui: {
++              eventType: "REASONING" | "THINKING";
++              messageId: string;
++            };
++          });
+         }
+         continue;
+       }
+@@ -420,34 +438,99 @@ export class RunAggregator {
+     this.emitUpdate(result);
+   }
+ 
+-  private handleReasoningStart(): void {
++  private handleReasoningStart(event: AgUiEvent): void {
+     if (!this.showThinking) return;
+-    this.reasoningActive = true;
+-    this.ensureReasoningPart();
++    const id = this.resolveReasoningId(event);
++    const entry = this.reasoningParts.get(id);
++    if (entry) {
++      entry.active = true;
++    }
+     this.emit();
+   }
+ 
+-  private handleReasoningContent(delta: string): void {
+-    if (!this.showThinking || !delta) return;
+-    this.reasoningBuffer += delta;
+-    this.ensureReasoningPart();
++  private handleReasoningContent(
++    event: Extract<
++      AgUiEvent,
++      | { type: "THINKING_TEXT_MESSAGE_CONTENT" }
++      | { type: "REASONING_MESSAGE_CONTENT" }
++    >,
++  ): void {
++    if (!this.showThinking || !event.delta) return;
++    const id = this.resolveReasoningId(event);
++    const entry = this.reasoningParts.get(id);
++    if (entry) {
++      entry.buffer += event.delta;
++    }
+     this.emit();
+   }
+ 
+-  private handleReasoningEnd(): void {
++  private handleReasoningEnd(event: AgUiEvent): void {
+     if (!this.showThinking) return;
++    const id = this.resolveReasoningId(event);
++    const entry = this.reasoningParts.get(id);
++    if (entry) {
++      entry.active = false;
++    }
++    if (this.activeReasoningId === id) {
++      this.activeReasoningId = undefined;
++    }
+     this.emit();
+   }
+ 
+-  private ensureReasoningPart(): void {
+-    if (this.hasReasoningPart) return;
++  private resolveReasoningId(event: AgUiEvent): string {
++    const messageId = "messageId" in event ? event.messageId : undefined;
++    const eventType = event.type.startsWith("REASONING")
++      ? "REASONING"
++      : "THINKING";
++
++    if (messageId) {
++      this.ensureReasoningPart(messageId, eventType, messageId);
++      this.activeReasoningId = messageId;
++      return messageId;
++    }
++
++    if (this.activeReasoningId) {
++      return this.activeReasoningId;
++    }
++
++    const generated = this.generateReasoningKey(eventType);
++    this.ensureReasoningPart(generated, eventType);
++    this.activeReasoningId = generated;
++    return generated;
++  }
++
++  private generateReasoningKey(eventType: "REASONING" | "THINKING"): string {
++    this.reasoningPartCounter += 1;
++    return `${eventType.toLowerCase()}-${this.reasoningPartCounter}`;
++  }
++
++  private ensureReasoningPart(
++    id: string,
++    eventType: "REASONING" | "THINKING",
++    messageId?: string,
++  ): void {
++    const existing = this.reasoningParts.get(id);
++    if (existing) {
++      existing.eventType = eventType;
++      if (messageId) {
++        existing.messageId = messageId;
++      }
++      return;
++    }
++
++    this.reasoningParts.set(id, {
++      buffer: "",
++      active: false,
++      eventType,
++      ...(messageId ? { messageId } : {}),
++    });
++
+     // ensure reasoning appears before the first text segment if possible
+     const textIndex = this.partOrder.findIndex((part) => part.kind === "text");
+     if (textIndex === -1) {
+-      this.partOrder.push({ kind: "reasoning" });
++      this.partOrder.push({ kind: "reasoning", key: id });
+     } else {
+-      this.partOrder.splice(textIndex, 0, { kind: "reasoning" });
++      this.partOrder.splice(textIndex, 0, { kind: "reasoning", key: id });
+     }
+-    this.hasReasoningPart = true;
+   }
+ }
