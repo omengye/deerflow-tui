@@ -2,6 +2,11 @@
 
 > 基于 Ink + assistant-ui + AG-UI 协议，构建终端内的 AI Agent 流式交互客户端
 
+> **状态更新（vendor 迁移后）**：本文档中所有 `from "@assistant-ui/react-ag-ui"` 的代码示例为历史设计快照。
+> 实际实现中 `useAgUiRuntime` 等运行时已 fork 到 `src/vendor/react-ag-ui/`，
+> 现代实际 import 路径为 `from "../vendor/react-ag-ui/index.js"`。
+> 详情见 `AG_UI_DISPLAY_VENDOR.md`。
+
 ---
 
 ## 一、方案概述

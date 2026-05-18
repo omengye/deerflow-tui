@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState } from "react";
-import { useAgUiRuntime } from "@assistant-ui/react-ag-ui";
+import { useAgUiRuntime } from "../vendor/react-ag-ui/index.js";
 import { HttpAgent } from "@ag-ui/client";
 import type { RunAgentInput, RunAgentParameters } from "@ag-ui/client";
 
@@ -378,7 +378,7 @@ export function useAgentRuntime() {
       },
     },
     showThinking: true,
-    onError: (e) => {
+    onError: (e: Error) => {
       console.error("[ag-ui]", e.message);
     },
   });

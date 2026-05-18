@@ -1,4 +1,2 @@
 allowBuilds:
   esbuild: true
-patchedDependencies:
-  '@assistant-ui/react-ag-ui@0.0.30': patches/@assistant-ui__react-ag-ui@0.0.30.patch

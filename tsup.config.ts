@@ -13,10 +13,11 @@ export default defineConfig({
   bundle: true,
   noExternal: [
     "@ag-ui/client",
-    "@assistant-ui/react-ag-ui",
+    "@assistant-ui/core",
     "@assistant-ui/react-ink",
     "@assistant-ui/react-ink-markdown",
     "assistant-cloud",
+    "assistant-stream",
     "ink",
     "react",
     "react-devtools-core",

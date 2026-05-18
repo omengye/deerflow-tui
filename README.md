@@ -184,6 +184,9 @@ src/
       InputBar.tsx                # 输入栏
     panels/
       StatusBar.tsx               # 状态栏
+  vendor/
+    react-ag-ui/                  # fork 自 @assistant-ui/react-ag-ui@0.0.30
+                                  # 见 AG_UI_DISPLAY_VENDOR.md
 
 scripts/
   package-win-sea.ps1             # Windows SEA 打包脚本

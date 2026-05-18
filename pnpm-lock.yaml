@@ -4,9 +4,6 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
-patchedDependencies:
-  '@assistant-ui/react-ag-ui@0.0.30': dd14ec59f302821c7de7b17f84f7d9b8d070bc9f63077f1eede2d6ae996a7742
-
 importers:
 
   .:
@@ -14,9 +11,9 @@ importers:
       '@ag-ui/client':
         specifier: 0.0.53
         version: 0.0.53
-      '@assistant-ui/react-ag-ui':
-        specifier: 0.0.30
-        version: 0.0.30(patch_hash=dd14ec59f302821c7de7b17f84f7d9b8d070bc9f63077f1eede2d6ae996a7742)(@assistant-ui/store@0.2.10(@assistant-ui/tap@0.5.11(@types/react@19.2.14)(react@19.2.6))(@types/react@19.2.14)(react@19.2.6))(@assistant-ui/tap@0.5.11(@types/react@19.2.14)(react@19.2.6))(@types/react@19.2.14)(assistant-cloud@0.1.27)(react@19.2.6)(zustand@5.0.13(@types/react@19.2.14)(react@19.2.6))
+      '@assistant-ui/core':
+        specifier: 0.2.2
+        version: 0.2.2(@assistant-ui/store@0.2.10(@assistant-ui/tap@0.5.11(@types/react@19.2.14)(react@19.2.6))(@types/react@19.2.14)(react@19.2.6))(@assistant-ui/tap@0.5.11(@types/react@19.2.14)(react@19.2.6))(@types/react@19.2.14)(assistant-cloud@0.1.27)(react@19.2.6)(zustand@5.0.13(@types/react@19.2.14)(react@19.2.6))
       '@assistant-ui/react-ink':
         specifier: 0.0.16
         version: 0.0.16(@types/react@19.2.14)(assistant-cloud@0.1.27)(ink@7.0.3(@types/react@19.2.14)(react-devtools-core@6.1.5)(react@19.2.6))(react@19.2.6)
@@ -26,6 +23,9 @@ importers:
       assistant-cloud:
         specifier: ^0.1.27
         version: 0.1.27
+      assistant-stream:
+        specifier: 0.3.14
+        version: 0.3.14
       dotenv:
         specifier: ^17.4.2
         version: 17.4.2
@@ -93,15 +93,6 @@ packages:
       react:
         optional: true
       zustand:
-        optional: true
-
-  '@assistant-ui/react-ag-ui@0.0.30':
-    resolution: {integrity: sha512-JYzQsSk+9cSRdq5qLf54areKern4yCO4MaZUOlxu0Ol0c+zzR/MvneTe+Ykcdux8TCdiw5S57XCjyTKzCcpStA==}
-    peerDependencies:
-      '@types/react': '*'
-      react: ^18 || ^19
-    peerDependenciesMeta:
-      '@types/react':
         optional: true
 
   '@assistant-ui/react-ink-markdown@0.0.15':
@@ -1372,22 +1363,6 @@ snapshots:
     transitivePeerDependencies:
       - ioredis
       - redis
-
-  '@assistant-ui/react-ag-ui@0.0.30(patch_hash=dd14ec59f302821c7de7b17f84f7d9b8d070bc9f63077f1eede2d6ae996a7742)(@assistant-ui/store@0.2.10(@assistant-ui/tap@0.5.11(@types/react@19.2.14)(react@19.2.6))(@types/react@19.2.14)(react@19.2.6))(@assistant-ui/tap@0.5.11(@types/react@19.2.14)(react@19.2.6))(@types/react@19.2.14)(assistant-cloud@0.1.27)(react@19.2.6)(zustand@5.0.13(@types/react@19.2.14)(react@19.2.6))':
-    dependencies:
-      '@ag-ui/client': 0.0.53
-      '@assistant-ui/core': 0.2.2(@assistant-ui/store@0.2.10(@assistant-ui/tap@0.5.11(@types/react@19.2.14)(react@19.2.6))(@types/react@19.2.14)(react@19.2.6))(@assistant-ui/tap@0.5.11(@types/react@19.2.14)(react@19.2.6))(@types/react@19.2.14)(assistant-cloud@0.1.27)(react@19.2.6)(zustand@5.0.13(@types/react@19.2.14)(react@19.2.6))
-      assistant-stream: 0.3.14
-      react: 19.2.6
-    optionalDependencies:
-      '@types/react': 19.2.14
-    transitivePeerDependencies:
-      - '@assistant-ui/store'
-      - '@assistant-ui/tap'
-      - assistant-cloud
-      - ioredis
-      - redis
-      - zustand
 
   '@assistant-ui/react-ink-markdown@0.0.15(@assistant-ui/react-ink@0.0.16(@types/react@19.2.14)(assistant-cloud@0.1.27)(ink@7.0.3(@types/react@19.2.14)(react-devtools-core@6.1.5)(react@19.2.6))(react@19.2.6))(@assistant-ui/tap@0.5.11(@types/react@19.2.14)(react@19.2.6))(@types/react@19.2.14)(assistant-cloud@0.1.27)(ink@7.0.3(@types/react@19.2.14)(react-devtools-core@6.1.5)(react@19.2.6))(react@19.2.6)(zustand@5.0.13(@types/react@19.2.14)(react@19.2.6))':
     dependencies:
