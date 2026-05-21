@@ -11,6 +11,9 @@ type AgUiPartMetadata = {
   toolMessageId?: string;
 };
 
+type AssistantMessage = Extract<ThreadMessage, { role: "assistant" }>;
+type AssistantContent = AssistantMessage["content"];
+
 export function Message() {
   const message = useAuiState((s) => s.message);
 
@@ -24,14 +27,24 @@ export function Message() {
   const agentName = (message as any).name || (message.metadata?.custom?.agui as any)?.agentName;
   const label = isUser ? "You" : isAssistant ? (agentName || "AI") : message.role;
   const color = isUser ? "green" : isAssistant ? "blue" : "magenta";
+  const assistantBlocks = isAssistant ? splitAssistantBlocks(message) : [];
+
+  if (isAssistant && assistantBlocks.length > 1) {
+    return (
+      <>
+        {assistantBlocks.map((block) => (
+          <MessageBlock key={block.key} label={label} color={color}>
+            <MessageContentParts parts={block.parts} />
+          </MessageBlock>
+        ))}
+      </>
+    );
+  }
 
   return (
-    <Box flexDirection="column" marginBottom={1}>
-      <Text bold color={color}>{label}:</Text>
-      <Box paddingLeft={2}>
-        <MessageContent message={message} />
-      </Box>
-    </Box>
+    <MessageBlock label={label} color={color}>
+      <MessageContent message={message} />
+    </MessageBlock>
   );
 }
 
@@ -40,72 +53,128 @@ function MessageContent({ message }: { message: ThreadMessage }) {
     return <Text dimColor>(empty)</Text>;
   }
 
+  return <MessageContentParts parts={message.content as AssistantContent} />;
+}
+
+function MessageContentParts({ parts }: { parts: AssistantContent }) {
+  if (!parts || parts.length === 0) {
+    return <Text dimColor>(empty)</Text>;
+  }
+
   return (
     <Box flexDirection="column">
-      {message.content.map((part, index) => {
-        const metadata = getAgUiMetadata(part);
-
-        if (part.type === "text") {
-          return (
-            <EventBlock
-              key={index}
-              metadata={metadata}
-              fallbackType="TEXT_MESSAGE"
-              fallbackId={`text-${index + 1}`}
-            >
-              <Text wrap="wrap">{part.text}</Text>
-            </EventBlock>
-          );
-        }
-
-        if (part.type === "reasoning") {
-          return (
-            <EventBlock
-              key={index}
-              metadata={metadata}
-              fallbackType="REASONING"
-              fallbackId={`reasoning-${index + 1}`}
-            >
-              <Text dimColor wrap="wrap">
-                {part.text}
-              </Text>
-            </EventBlock>
-          );
-        }
-
-        if (part.type === "tool-call") {
-          return (
-            <EventBlock
-              key={index}
-              metadata={metadata}
-              fallbackType="TOOL_CALL"
-              fallbackId={part.toolCallId}
-            >
-              <CompactToolCall toolCall={part} />
-            </EventBlock>
-          );
-        }
-
-        if (isAgUiStatePart(part as unknown)) {
-          const statePart = part as unknown as { type: "agui-state"; text: string };
-          return (
-            <EventBlock
-              key={index}
-              metadata={metadata}
-              fallbackType="STATE"
-              fallbackId={`state-${index + 1}`}
-            >
-              <Text dimColor wrap="wrap">
-                {truncateLines(statePart.text, 8)}
-              </Text>
-            </EventBlock>
-          );
-        }
-
-        return null;
-      })}
+      {parts.map((part, index) => renderMessagePart(part, index))}
     </Box>
   );
+}
+
+function MessageBlock({
+  children,
+  label,
+  color,
+}: {
+  children: ReactNode;
+  label: string;
+  color: string;
+}) {
+  return (
+    <Box flexDirection="column" marginBottom={1}>
+      <Text bold color={color}>{label}:</Text>
+      <Box paddingLeft={2}>
+        {children}
+      </Box>
+    </Box>
+  );
+}
+
+function renderMessagePart(part: AssistantContent[number], index: number) {
+  const metadata = getAgUiMetadata(part);
+
+  if (part.type === "text") {
+    return (
+      <EventBlock
+        key={index}
+        metadata={metadata}
+        fallbackType="TEXT_MESSAGE"
+        fallbackId={`text-${index + 1}`}
+      >
+        <Text wrap="wrap">{part.text}</Text>
+      </EventBlock>
+    );
+  }
+
+  if (part.type === "reasoning") {
+    return (
+      <EventBlock
+        key={index}
+        metadata={metadata}
+        fallbackType="REASONING"
+        fallbackId={`reasoning-${index + 1}`}
+      >
+        <Text dimColor wrap="wrap">
+          {part.text}
+        </Text>
+      </EventBlock>
+    );
+  }
+
+  if (part.type === "tool-call") {
+    return (
+      <EventBlock
+        key={index}
+        metadata={metadata}
+        fallbackType="TOOL_CALL"
+        fallbackId={part.toolCallId}
+      >
+        <CompactToolCall toolCall={part} />
+      </EventBlock>
+    );
+  }
+
+  if (isAgUiStatePart(part as unknown)) {
+    const statePart = part as unknown as { type: "agui-state"; text: string };
+    return (
+      <EventBlock
+        key={index}
+        metadata={metadata}
+        fallbackType="STATE"
+        fallbackId={`state-${index + 1}`}
+      >
+        <Text dimColor wrap="wrap">
+          {truncateLines(statePart.text, 8)}
+        </Text>
+      </EventBlock>
+    );
+  }
+
+  return null;
+}
+
+function splitAssistantBlocks(message: ThreadMessage): Array<{
+  key: string;
+  parts: AssistantContent;
+}> {
+  if (message.role !== "assistant" || !message.content || message.content.length === 0) {
+    return [];
+  }
+
+  const blocks: Array<{ key: string; parts: AssistantContent }> = [];
+
+  for (const [index, part] of message.content.entries()) {
+    const metadata = getAgUiMetadata(part);
+    const messageId = metadata?.messageId;
+    const blockKey = messageId ?? `part-${index}`;
+    const current = blocks.at(-1);
+
+    if (!current || current.key !== blockKey) {
+      blocks.push({ key: blockKey, parts: [part] });
+      continue;
+    }
+
+    current.parts = [...current.parts, part];
+  }
+
+  return blocks;
 }
 
 function EventBlock({
