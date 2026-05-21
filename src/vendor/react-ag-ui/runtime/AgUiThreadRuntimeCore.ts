@@ -54,6 +54,10 @@ type CoreOptions = {
 
 const FALLBACK_USER_STATUS = { type: "complete", reason: "unknown" } as const;
 
+function normalizeReplayText(text: string): string {
+  return text.replace(/\r\n/g, "\n").trim();
+}
+
 export class AgUiThreadRuntimeCore {
   private agent: HttpAgent;
   private logger: Logger;
@@ -433,6 +437,16 @@ export class AgUiThreadRuntimeCore {
     this.notifyUpdate();
   }
 
+  resetThread(): void {
+    this.assistantHistoryParents.clear();
+    this.messages = [];
+    this.recordedHistoryIds.clear();
+    this.stateSnapshot = undefined;
+    this.pendingError = null;
+    this.lastRunConfig = undefined;
+    this.notifyUpdate();
+  }
+
   loadExternalState(state: ReadonlyJSONValue): void {
     this.stateSnapshot = state;
     this.notifyUpdate();
@@ -446,14 +460,15 @@ export class AgUiThreadRuntimeCore {
     const normalizedRunConfig = runConfig ?? {};
     this.lastRunConfig = normalizedRunConfig;
     this.resetHead(parentId);
-    const historicalMessages = [...this.messages];
+    const runMessages = this.getRunMessages(parentId);
+    const replayFilter = this.getReplayFilter(runMessages);
 
     const runId = generateId();
     this.pendingError = null;
     const input = this.buildRunInput(
       runId,
       normalizedRunConfig,
-      historicalMessages,
+      runMessages,
       resume,
     );
     const assistantParentId = parentId ?? this.messages.at(-1)?.id ?? null;
@@ -469,6 +484,7 @@ export class AgUiThreadRuntimeCore {
     const aggregator = new RunAggregator({
       showThinking: this.showThinking,
       logger: this.logger,
+      replayFilter,
       emit: (update: ChatModelRunResult) => {
         const resolved = this.updateAssistantMessage(ensureAssistant(), update);
         if (resolved !== assistantMessageId) {
@@ -477,9 +493,8 @@ export class AgUiThreadRuntimeCore {
       },
       onServerMessageId: (serverId: string) => {
         const placeholder = ensureAssistant();
-        if (placeholder === serverId) return;
-        this.reassignAssistantId(placeholder, serverId);
-        assistantMessageId = serverId;
+        const uniqueId = `${input.threadId}:${runId}:${serverId}`;
+        assistantMessageId = this.reassignAssistantId(placeholder, uniqueId);
       },
     });
     const dispatch = (event: AgUiEvent) => this.handleEvent(aggregator, event);
@@ -540,19 +555,58 @@ export class AgUiThreadRuntimeCore {
     }
   }
 
+  private getRunMessages(parentId: string | null): ThreadMessage[] {
+    if (!parentId) return [];
+    const message = this.messages.find((entry) => entry.id === parentId);
+    return message?.role === "user" ? [message] : [];
+  }
+
+  private getReplayFilter(runMessages: readonly ThreadMessage[]) {
+    const runMessageIds = new Set(runMessages.map((message) => message.id));
+    const texts: string[] = [];
+    const reasoning: string[] = [];
+    const toolCallIds = new Set<string>();
+
+    for (const message of this.messages) {
+      if (runMessageIds.has(message.id) || message.role !== "assistant") {
+        continue;
+      }
+
+      for (const part of message.content) {
+        if (part.type === "text") {
+          const text = normalizeReplayText(part.text);
+          if (text) texts.push(text);
+          continue;
+        }
+
+        if (part.type === "reasoning") {
+          const text = normalizeReplayText(part.text);
+          if (text) reasoning.push(text);
+          continue;
+        }
+
+        if (part.type === "tool-call") {
+          toolCallIds.add(part.toolCallId);
+        }
+      }
+    }
+
+    return { texts, reasoning, toolCallIds };
+  }
+
   private buildRunInput(
     runId: string,
     runConfig: RunConfig | undefined,
-    historyMessages: readonly ThreadMessage[] | undefined,
+    runMessages: readonly ThreadMessage[] | undefined,
     resume?: AgUiResumeEntry[],
   ) {
     const threadId = this.agent.threadId || "main";
-    const messages = toAgUiMessages(historyMessages ?? this.messages);
+    const messages = toAgUiMessages(runMessages ?? []);
     const context = this.runtime?.thread.getModelContext();
     return {
       threadId,
       runId,
-      state: this.stateSnapshot ?? null,
+      state: null,
       messages,
       tools: toAgUiTools(context?.tools),
       context: context?.system
@@ -621,22 +675,22 @@ export class AgUiThreadRuntimeCore {
     return id;
   }
 
-  private reassignAssistantId(oldId: string, newId: string): void {
-    if (oldId === newId) return;
+  private reassignAssistantId(oldId: string, newId: string): string {
+    if (oldId === newId) return oldId;
 
     const collidesWithExisting = this.messages.some((m) => m.id === newId);
 
     if (collidesWithExisting) {
       this.logger.debug?.(
-        "[agui] reassignAssistantId: server id already present in messages, dropping placeholder",
+        "[agui] reassignAssistantId: server id already present in messages, keeping unique placeholder ID",
         { oldId, newId },
       );
-      this.messages = this.messages.filter((m) => m.id !== oldId);
-    } else {
-      this.messages = this.messages.map((m) =>
-        m.id === oldId ? { ...m, id: newId } : m,
-      );
+      return oldId;
     }
+
+    this.messages = this.messages.map((m) =>
+      m.id === oldId ? { ...m, id: newId } : m,
+    );
 
     const pendingParent = this.assistantHistoryParents.get(oldId);
     if (pendingParent !== undefined) {
@@ -652,6 +706,7 @@ export class AgUiThreadRuntimeCore {
     }
 
     this.notifyUpdate();
+    return newId;
   }
 
   private updateAssistantMessage(

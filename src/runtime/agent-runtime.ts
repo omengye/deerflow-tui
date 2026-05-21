@@ -27,6 +27,12 @@ type CompatRunAgentInput = RunAgentInput & {
   resume?: unknown;
 };
 
+type HistoricalAssistantMessages = {
+  ids: ReadonlySet<string>;
+  texts: ReadonlySet<string>;
+  orderedTexts: readonly string[];
+};
+
 function normalizeUrl(raw: string): string {
   try {
     const url = new URL(raw);
@@ -55,15 +61,25 @@ function installFetchPatch() {
           ? input.href
           : (input as Request).url;
 
+    let requestBody: any = init?.body;
+    if (!requestBody && input && typeof input === "object" && "clone" in input) {
+      try {
+        const clonedRequest = (input as Request).clone();
+        requestBody = await clonedRequest.text();
+      } catch {
+        // Ignore requests whose bodies cannot be cloned.
+      }
+    }
+
     const response = await originalFetch(input, init);
 
     if (normalizeUrl(rawUrl) !== targetUrl || !response.body) return response;
     const contentType = response.headers.get("content-type") ?? "";
     if (!contentType.includes("event-stream")) return response;
 
-    const ignoredTextMessageIds = getHistoricalAssistantMessageIds(init?.body);
+    const historicalAssistantMessages = getHistoricalAssistantMessages(requestBody);
 
-    return new Response(rewriteSseStream(response.body, ignoredTextMessageIds), {
+    return new Response(rewriteSseStream(response.body, historicalAssistantMessages), {
       status: response.status,
       statusText: response.statusText,
       headers: cloneStreamHeaders(response.headers),
@@ -75,11 +91,12 @@ installFetchPatch();
 
 function rewriteSseStream(
   body: ReadableStream<Uint8Array>,
-  ignoredTextMessageIds: ReadonlySet<string>,
+  historicalAssistantMessages: HistoricalAssistantMessages,
 ): ReadableStream<Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffer = "";
+  const rewriter = new SseEventRewriter(historicalAssistantMessages);
 
   const transformer = new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
@@ -88,8 +105,7 @@ function rewriteSseStream(
 
       while (idx !== -1) {
         const eventText = buffer.slice(0, idx.eventEnd);
-        const rewritten = rewriteSseEvent(eventText, ignoredTextMessageIds);
-        if (rewritten !== undefined) {
+        for (const rewritten of rewriter.rewrite(eventText)) {
           controller.enqueue(encoder.encode(`${rewritten}\n\n`));
         }
         buffer = buffer.slice(idx.nextEventStart);
@@ -100,16 +116,106 @@ function rewriteSseStream(
       const tail = decoder.decode();
       if (tail) buffer += tail;
       if (buffer.length > 0) {
-        const rewritten = rewriteSseEvent(buffer, ignoredTextMessageIds);
-        if (rewritten !== undefined) {
-          controller.enqueue(encoder.encode(rewritten));
+        for (const rewritten of rewriter.rewrite(buffer)) {
+          controller.enqueue(encoder.encode(`${rewritten}\n\n`));
         }
         buffer = "";
+      }
+      for (const rewritten of rewriter.flush()) {
+        controller.enqueue(encoder.encode(`${rewritten}\n\n`));
       }
     },
   });
 
   return body.pipeThrough(transformer);
+}
+
+type ParsedSseEvent = {
+  eventText: string;
+  data: string;
+  value: unknown;
+  serialize: (data: string) => string;
+};
+
+type BufferedTextMessage = {
+  events: string[];
+  text: string;
+  startEvent?: string;
+  endEvent?: string;
+  contentTemplate?: Record<string, unknown>;
+};
+
+class SseEventRewriter {
+  private readonly historicalIds: ReadonlySet<string>;
+  private readonly historicalTexts: ReadonlySet<string>;
+  private readonly orderedHistoricalTexts: readonly string[];
+  private readonly pendingTextMessages = new Map<string, BufferedTextMessage>();
+
+  constructor(history: HistoricalAssistantMessages) {
+    this.historicalIds = history.ids;
+    this.historicalTexts = history.texts;
+    this.orderedHistoricalTexts = history.orderedTexts;
+  }
+
+  rewrite(eventText: string): string[] {
+    const parsed = parseSseEvent(eventText);
+    if (!parsed) return [eventText];
+
+    const rewritten = rewriteJsonValue(parsed.value);
+    if (rewritten === undefined) return [];
+
+    const normalizedEvent =
+      rewritten.changed ? parsed.serialize(JSON.stringify(rewritten.value)) : eventText;
+
+    if (shouldDropHistoricalTextMessageEvent(rewritten.value, this.historicalIds)) {
+      return [];
+    }
+
+    const textEvent = getTextMessageEvent(rewritten.value);
+    if (!textEvent) return [normalizedEvent];
+
+    const key = textEvent.messageId ?? "__default_text_message__";
+    let pending = this.pendingTextMessages.get(key);
+
+    if (!pending) {
+      pending = { events: [], text: "" };
+      this.pendingTextMessages.set(key, pending);
+    }
+
+    pending.events.push(normalizedEvent);
+    if (textEvent.delta) pending.text += textEvent.delta;
+    if (textEvent.kind === "start") pending.startEvent = normalizedEvent;
+    if (textEvent.kind === "end") pending.endEvent = normalizedEvent;
+    if (textEvent.kind === "content" && isRecord(rewritten.value)) {
+      pending.contentTemplate = rewritten.value;
+    }
+
+    if (textEvent.kind !== "end") return [];
+
+    this.pendingTextMessages.delete(key);
+    if (this.historicalTexts.has(normalizeHistoricalTextContent(pending.text))) {
+      return [];
+    }
+
+    const strippedText = stripHistoricalReplayPrefix(
+      pending.text,
+      this.orderedHistoricalTexts,
+    );
+    if (strippedText !== pending.text) {
+      if (!strippedText.trim()) return [];
+      return serializeStrippedTextMessage(pending, strippedText);
+    }
+
+    return pending.events;
+  }
+
+  flush(): string[] {
+    const events = Array.from(this.pendingTextMessages.values()).flatMap(
+      (entry) => entry.events,
+    );
+    this.pendingTextMessages.clear();
+    return events;
+  }
 }
 
 function findSseEventBoundary(
@@ -130,10 +236,7 @@ function cloneStreamHeaders(headers: Headers): Headers {
   return cloned;
 }
 
-function rewriteSseEvent(
-  eventText: string,
-  ignoredTextMessageIds: ReadonlySet<string>,
-): string | undefined {
+function parseSseEvent(eventText: string): ParsedSseEvent | null {
   const lines = eventText.split(/\r?\n/);
   const dataLineIndexes: number[] = [];
   const dataParts: string[] = [];
@@ -147,39 +250,111 @@ function rewriteSseEvent(
     dataParts.push(line.slice(dataPrefix.length));
   });
 
-  if (dataLineIndexes.length === 0) return eventText;
+  if (dataLineIndexes.length === 0) return null;
 
   const data = dataParts.join("\n");
-  const rewritten = rewriteJsonData(data, ignoredTextMessageIds);
 
-  if (rewritten === undefined) return undefined;
+  try {
+    const value = JSON.parse(data) as unknown;
 
-  if (rewritten === data) return eventText;
+    return {
+      eventText,
+      data,
+      value,
+      serialize: (rewrittenData: string) => {
+        if (rewrittenData === data) return eventText;
 
-  const skipDataIndexes = new Set(dataLineIndexes.slice(1));
-  const rewrittenLines = lines.flatMap((line, index) => {
-    if (index === dataLineIndexes[0]) return [`${firstDataPrefix}${rewritten}`];
-    if (skipDataIndexes.has(index)) return [];
-    return [line];
-  });
+        const skipDataIndexes = new Set(dataLineIndexes.slice(1));
+        const rewrittenLines = lines.flatMap((line, index) => {
+          if (index === dataLineIndexes[0]) return [`${firstDataPrefix}${rewrittenData}`];
+          if (skipDataIndexes.has(index)) return [];
+          return [line];
+        });
 
-  return rewrittenLines.join(eventText.includes("\r\n") ? "\r\n" : "\n");
+        return rewrittenLines.join(eventText.includes("\r\n") ? "\r\n" : "\n");
+      },
+    };
+  } catch {
+    return null;
+  }
 }
 
-function rewriteJsonData(
-  data: string,
-  ignoredTextMessageIds: ReadonlySet<string>,
-): string | undefined {
-  try {
-    const parsed = JSON.parse(data) as unknown;
-    if (shouldDropHistoricalTextMessageEvent(parsed, ignoredTextMessageIds)) {
-      return undefined;
-    }
-    const rewritten = normalizeAgUiRoles(parsed);
-    return rewritten.changed ? JSON.stringify(rewritten.value) : data;
-  } catch {
-    return data;
+function rewriteJsonValue(value: unknown): { value: unknown; changed: boolean } | undefined {
+  if (isRecord(value) && value.type === "MESSAGES_SNAPSHOT") {
+    return undefined;
   }
+  return normalizeAgUiRoles(value);
+}
+
+function getTextMessageEvent(
+  value: unknown,
+): { kind: "start" | "content" | "end"; messageId?: string; delta?: string } | null {
+  if (!isRecord(value)) return null;
+
+  if (value.type === "TEXT_MESSAGE_START") {
+    return {
+      kind: "start",
+      ...(typeof value.messageId === "string" ? { messageId: value.messageId } : {}),
+    };
+  }
+
+  if (value.type === "TEXT_MESSAGE_CONTENT" || value.type === "TEXT_MESSAGE_CHUNK") {
+    return {
+      kind: "content",
+      ...(typeof value.messageId === "string" ? { messageId: value.messageId } : {}),
+      ...(typeof value.delta === "string" ? { delta: value.delta } : {}),
+    };
+  }
+
+  if (value.type === "TEXT_MESSAGE_END") {
+    return {
+      kind: "end",
+      ...(typeof value.messageId === "string" ? { messageId: value.messageId } : {}),
+    };
+  }
+
+  return null;
+}
+
+function stripHistoricalReplayPrefix(
+  text: string,
+  orderedHistoricalTexts: readonly string[],
+): string {
+  let remaining = text;
+
+  for (const historicalText of orderedHistoricalTexts) {
+    const trimmedHistory = historicalText.trim();
+    if (!trimmedHistory) continue;
+
+    const leadingWhitespace = remaining.match(/^\s*/)?.[0] ?? "";
+    const candidate = remaining.slice(leadingWhitespace.length);
+
+    if (!candidate.startsWith(trimmedHistory)) {
+      continue;
+    }
+
+    remaining = candidate.slice(trimmedHistory.length);
+  }
+
+  return remaining.replace(/^\s+/, "");
+}
+
+function serializeStrippedTextMessage(
+  pending: BufferedTextMessage,
+  text: string,
+): string[] {
+  if (!pending.contentTemplate) return pending.events;
+
+  const contentEvent = {
+    ...pending.contentTemplate,
+    delta: text,
+  };
+
+  return [
+    ...(pending.startEvent ? [pending.startEvent] : []),
+    `data: ${JSON.stringify(contentEvent)}`,
+    ...(pending.endEvent ? [pending.endEvent] : []),
+  ];
 }
 
 function shouldDropHistoricalTextMessageEvent(
@@ -198,27 +373,90 @@ function shouldDropHistoricalTextMessageEvent(
 
   return (
     typeof value.messageId === "string" &&
-    ignoredTextMessageIds.has(value.messageId)
+    ignoredTextMessageIds.has(normalizeHistoricalTextMessageId(value.messageId))
   );
 }
 
-function getHistoricalAssistantMessageIds(body: unknown): Set<string> {
-  if (typeof body !== "string") return new Set();
+function normalizeHistoricalTextMessageId(id: string): string {
+  const parts = id.split(":");
+  if (parts.length >= 3) {
+    return parts.slice(2).join(":");
+  }
+  return id;
+}
+
+function getHistoricalAssistantMessages(body: unknown): HistoricalAssistantMessages {
+  const empty: HistoricalAssistantMessages = {
+    ids: new Set(),
+    texts: new Set(),
+    orderedTexts: [],
+  };
+
+  if (!body) return empty;
+
+  let bodyStr = "";
+  if (typeof body === "string") {
+    bodyStr = body;
+  } else if (body instanceof Uint8Array || body instanceof ArrayBuffer) {
+    try {
+      bodyStr = new TextDecoder().decode(body);
+    } catch {
+      return empty;
+    }
+  } else {
+    try {
+      bodyStr = String(body);
+    } catch {
+      return empty;
+    }
+  }
 
   try {
-    const parsed = JSON.parse(body) as unknown;
-    if (!isRecord(parsed) || !Array.isArray(parsed.messages)) return new Set();
+    const parsed = JSON.parse(bodyStr) as unknown;
+    if (!isRecord(parsed) || !Array.isArray(parsed.messages)) {
+      return empty;
+    }
 
-    const ids = parsed.messages
+    const assistantMessages = parsed.messages
       .filter((message): message is Record<string, unknown> => isRecord(message))
-      .filter((message) => message.role === "assistant")
+      .filter((message) => message.role === "assistant" || message.role === "ai");
+
+    const ids = assistantMessages
       .map((message) => message.id)
       .filter((id): id is string => typeof id === "string" && id.length > 0);
 
-    return new Set(ids);
+    const orderedTexts = assistantMessages
+      .map((message) => extractHistoricalTextContent(message.content))
+      .filter((text): text is string => text !== undefined && text.length > 0)
+      .map(normalizeHistoricalTextContent);
+
+    return {
+      ids: new Set(ids.map(normalizeHistoricalTextMessageId)),
+      texts: new Set(orderedTexts),
+      orderedTexts,
+    };
   } catch {
-    return new Set();
+    return empty;
   }
+}
+
+function extractHistoricalTextContent(content: unknown): string | undefined {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return undefined;
+
+  const text = content
+    .filter(
+      (part): part is { type: "text"; text: string } =>
+        isRecord(part) && part.type === "text" && typeof part.text === "string",
+    )
+    .map((part) => part.text)
+    .join("\n");
+
+  return text.length > 0 ? text : undefined;
+}
+
+function normalizeHistoricalTextContent(text: string): string {
+  return text.replace(/\r\n/g, "\n").trim();
 }
 
 function normalizeAgUiRoles(value: unknown): { value: unknown; changed: boolean } {

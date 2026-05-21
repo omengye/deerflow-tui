@@ -12,6 +12,7 @@ export const AG_UI_METADATA_NAMESPACE = "agui";
 
 export type AgUiCustomMetadata = {
   interrupts?: AgUiInterrupt[];
+  agentName?: string;
 };
 
 type Emit = (update: ChatModelRunResult) => void;
@@ -34,11 +35,41 @@ type ReasoningState = {
   messageId?: string;
 };
 
+function normalizeReplayText(text: string): string {
+  return text.replace(/\r\n/g, "\n").trim();
+}
+
+function filterReplayText(
+  buffer: string,
+  historicalTexts: readonly string[],
+): string | undefined {
+  const normalized = normalizeReplayText(buffer);
+  if (!normalized) return undefined;
+
+  for (const historicalText of historicalTexts) {
+    if (!historicalText) continue;
+    if (historicalText === normalized || historicalText.startsWith(normalized)) {
+      return undefined;
+    }
+    if (normalized.startsWith(historicalText)) {
+      const remainder = normalized.slice(historicalText.length).trimStart();
+      return remainder.length > 0 ? remainder : undefined;
+    }
+  }
+
+  return buffer;
+}
+
 export type RunAggregatorOptions = {
   showThinking: boolean;
   logger: Logger;
   emit: Emit;
   onServerMessageId?: (messageId: string) => void;
+  replayFilter?: {
+    texts: readonly string[];
+    reasoning: readonly string[];
+    toolCallIds: ReadonlySet<string>;
+  };
 };
 
 /**
@@ -52,6 +83,7 @@ export class RunAggregator {
   private readonly showThinking: boolean;
   private readonly logger: Logger;
   private readonly onServerMessageId: ((messageId: string) => void) | undefined;
+  private readonly replayFilter: NonNullable<RunAggregatorOptions["replayFilter"]>;
 
   private status: ChatModelRunResult["status"] | undefined;
   private interrupts: AgUiInterrupt[] | undefined;
@@ -65,6 +97,7 @@ export class RunAggregator {
   private readonly reasoningParts = new Map<string, ReasoningState>();
   private activeReasoningId: string | undefined;
   private readonly toolCalls = new Map<string, ToolCallState>();
+  private readonly ignoredToolCallIds = new Set<string>();
   private readonly partOrder: (
     | { kind: "text"; key: string }
     | { kind: "reasoning"; key: string }
@@ -73,15 +106,25 @@ export class RunAggregator {
   private textPartCounter = 0;
   private reasoningPartCounter = 0;
   private serverMessageIdReported = false;
+  private agentName: string | undefined;
 
   constructor(options: RunAggregatorOptions) {
     this.emitUpdate = options.emit;
     this.showThinking = options.showThinking;
     this.logger = options.logger;
     this.onServerMessageId = options.onServerMessageId;
+    this.replayFilter = options.replayFilter ?? {
+      texts: [],
+      reasoning: [],
+      toolCallIds: new Set(),
+    };
   }
 
   handle(event: AgUiEvent): void {
+    if (event.agentName) {
+      this.agentName = event.agentName;
+    }
+
     switch (event.type) {
       case "RUN_STARTED": {
         this.clearTextParts();
@@ -89,6 +132,7 @@ export class RunAggregator {
         this.ignoredTextMessageIds.clear();
         this.reasoningParts.clear();
         this.toolCalls.clear();
+        this.ignoredToolCallIds.clear();
         this.partOrder.length = 0;
         this.textPartCounter = 0;
         this.reasoningPartCounter = 0;
@@ -96,6 +140,7 @@ export class RunAggregator {
         this.activeReasoningId = undefined;
         this.interrupts = undefined;
         this.serverMessageIdReported = false;
+        this.agentName = undefined;
         this.status = { type: "running" };
         this.emit();
         break;
@@ -204,16 +249,26 @@ export class RunAggregator {
         if (event.type === "TOOL_CALL_CHUNK") {
           this.reportServerMessageId(event.parentMessageId);
         }
+        if (event.toolCallId && this.ignoredToolCallIds.has(event.toolCallId)) {
+          break;
+        }
         if (!event.delta) break;
         this.appendToolArgs(event.toolCallId, event.delta);
         this.emit();
         break;
       }
       case "TOOL_CALL_END": {
+        if (event.toolCallId && this.ignoredToolCallIds.has(event.toolCallId)) {
+          this.ignoredToolCallIds.delete(event.toolCallId);
+          break;
+        }
         this.emit();
         break;
       }
       case "TOOL_CALL_RESULT": {
+        if (this.ignoredToolCallIds.has(event.toolCallId)) {
+          break;
+        }
         this.finishToolCall(
           event.toolCallId,
           event.content ?? "",
@@ -225,6 +280,10 @@ export class RunAggregator {
       }
 
       default: {
+        if (event.type === "RAW" && event.event && typeof event.event === "object" && typeof event.event.name === "string") {
+          this.agentName = event.event.name;
+          this.emit();
+        }
         this.logger.debug?.("[agui] aggregator ignored event", event);
       }
     }
@@ -320,6 +379,10 @@ export class RunAggregator {
     parentMessageId?: string,
   ) {
     if (!id) return;
+    if (this.replayFilter.toolCallIds.has(id)) {
+      this.ignoredToolCallIds.add(id);
+      return;
+    }
     if (
       !this.partOrder.some(
         (part) => part.kind === "tool-call" && part.toolCallId === id,
@@ -405,14 +468,18 @@ export class RunAggregator {
     for (const part of this.partOrder) {
       if (part.kind === "reasoning") {
         const entry = this.reasoningParts.get(part.key);
+        const text = entry
+          ? filterReplayText(entry.buffer, this.replayFilter.reasoning)
+          : undefined;
         if (
           entry &&
           this.showThinking &&
-          (entry.active || entry.buffer.length > 0)
+          text !== undefined &&
+          (entry.active || text.length > 0)
         ) {
           snapshot.push({
             type: "reasoning",
-            text: entry.buffer,
+            text,
             unstable_agui: {
               eventType: entry.eventType,
               messageId: entry.messageId ?? part.key,
@@ -429,8 +496,23 @@ export class RunAggregator {
 
       if (part.kind === "text") {
         const entry = this.textParts.get(part.key);
-        if (entry?.touched) {
-          snapshot.push({ type: "text", text: entry.buffer } as const);
+        const text = entry
+          ? filterReplayText(entry.buffer, this.replayFilter.texts)
+          : undefined;
+        if (entry?.touched && text !== undefined) {
+          snapshot.push({
+            type: "text",
+            text,
+            unstable_agui: {
+              eventType: "TEXT_MESSAGE",
+              messageId: part.key,
+            },
+          } as ThreadAssistantMessagePart & {
+            unstable_agui: {
+              eventType: "TEXT_MESSAGE";
+              messageId: string;
+            };
+          });
         }
         continue;
       }
@@ -456,17 +538,14 @@ export class RunAggregator {
     const result: ChatModelRunResult = {
       content: snapshot,
       ...(this.status ? { status: this.status } : undefined),
-      ...(this.interrupts
-        ? {
-            metadata: {
-              custom: {
-                [AG_UI_METADATA_NAMESPACE]: {
-                  interrupts: this.interrupts,
-                } satisfies AgUiCustomMetadata,
-              },
-            },
-          }
-        : undefined),
+      metadata: {
+        custom: {
+          [AG_UI_METADATA_NAMESPACE]: {
+            ...(this.interrupts ? { interrupts: this.interrupts } : {}),
+            ...(this.agentName ? { agentName: this.agentName } : {}),
+          } satisfies AgUiCustomMetadata,
+        },
+      },
     };
     this.emitUpdate(result);
   }

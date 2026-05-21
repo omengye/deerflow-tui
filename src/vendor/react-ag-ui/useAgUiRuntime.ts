@@ -94,7 +94,7 @@ export function useAgUiRuntime(
         ? async () => {
             toolInvocationsRef.current.reset();
             await onSwitchToNewThread();
-            core.applyExternalMessages([]);
+            core.resetThread();
           }
         : undefined,
       onSwitchToThread: onSwitchToThread

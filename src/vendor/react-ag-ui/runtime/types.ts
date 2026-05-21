@@ -73,7 +73,7 @@ export type AgUiRunFinishedOutcome =
   | { type: "success" }
   | { type: "interrupt"; interrupts: AgUiInterrupt[] };
 
-export type AgUiEvent =
+export type AgUiEvent = (
   | { type: "RUN_STARTED"; runId: string }
   | {
       type: "RUN_FINISHED";
@@ -122,4 +122,5 @@ export type AgUiEvent =
   | { type: "CUSTOM"; name: string; value: any }
   | { type: "STATE_SNAPSHOT"; snapshot: any }
   | { type: "STATE_DELTA"; delta: any[] }
-  | { type: "MESSAGES_SNAPSHOT"; messages: any[] };
+  | { type: "MESSAGES_SNAPSHOT"; messages: any[] }
+) & { agentName?: string };

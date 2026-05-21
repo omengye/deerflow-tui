@@ -54,6 +54,14 @@ type ToolCallPart = {
   unstable_toolMessageId?: string;
 };
 
+type TextPart = {
+  type: "text";
+  text?: string;
+  unstable_agui?: {
+    messageId?: string;
+  };
+};
+
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null;
 
@@ -115,6 +123,21 @@ function extractText(content: unknown): string {
     )
     .map((part) => part.text)
     .join("\n");
+}
+
+function getAgUiTextMessageId(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined;
+
+  for (const part of content) {
+    if (!isObject(part) || part.type !== "text") continue;
+    const textPart = part as TextPart;
+    const messageId = textPart.unstable_agui?.messageId;
+    if (typeof messageId === "string" && messageId.length > 0) {
+      return messageId;
+    }
+  }
+
+  return undefined;
 }
 
 function parseDataUrl(
@@ -329,7 +352,9 @@ function toAssistantSnapshotMessage(
     ...(text.length > 0 ? [{ type: "text" as const, text }] : []),
     ...toolCallParts,
   ];
-  const messageName = getString(rawMessage, "name");
+  const messageName =
+    getString(rawMessage, "name") ??
+    (isObject(rawMessage.rawEvent) ? getString(rawMessage.rawEvent, "name") : undefined);
   return {
     id: getString(rawMessage, "id") ?? generateId(),
     role: "assistant",
@@ -479,7 +504,7 @@ function convertAssistantMessage(
   }));
 
   const assistantMessage: AgUiMessage = {
-    id: message.id,
+    id: getAgUiTextMessageId(message.content) ?? message.id,
     role: "assistant",
     content,
   };

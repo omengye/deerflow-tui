@@ -21,7 +21,8 @@ export function Message() {
     return null;
   }
 
-  const label = isUser ? "You" : isAssistant ? "AI" : message.role;
+  const agentName = (message as any).name || (message.metadata?.custom?.agui as any)?.agentName;
+  const label = isUser ? "You" : isAssistant ? (agentName || "AI") : message.role;
   const color = isUser ? "green" : isAssistant ? "blue" : "magenta";
 
   return (
