@@ -294,8 +294,67 @@ function truncateLines(value: string, maxLines: number): string {
   return `${lines.slice(0, maxLines).join("\n")}\n...`;
 }
 
+function getTerminalWidth(): number {
+  return process.stdout.columns || 80;
+}
+
+function getStringWidth(str: string): number {
+  let width = 0;
+  for (let i = 0; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+    if (code > 255) {
+      width += 2;
+    } else {
+      width += 1;
+    }
+  }
+  return width;
+}
+
+function wrapText(text: string, width: number): string[] {
+  const lines: string[] = [];
+  const rawLines = text.split("\n");
+  
+  for (const rawLine of rawLines) {
+    if (getStringWidth(rawLine) <= width) {
+      lines.push(rawLine);
+      continue;
+    }
+    
+    let currentLine = "";
+    let currentWidth = 0;
+    
+    for (let i = 0; i < rawLine.length; i++) {
+      const char = rawLine[i];
+      const charWidth = char.charCodeAt(0) > 255 ? 2 : 1;
+      
+      if (currentWidth + charWidth <= width) {
+        currentLine += char;
+        currentWidth += charWidth;
+      } else {
+        if (currentLine.length > 0) {
+          lines.push(currentLine);
+        }
+        currentLine = char;
+        currentWidth = charWidth;
+      }
+    }
+    
+    if (currentLine.length > 0) {
+      lines.push(currentLine);
+    }
+  }
+  
+  return lines;
+}
+
 function truncateLinesKeepLast(value: string, maxLines: number): string {
-  const lines = value.split("\n");
+  const terminalWidth = getTerminalWidth();
+  // Safe margin of 10 columns to account for indentation, padding, and border.
+  const padding = 10;
+  const wrapWidth = Math.max(20, terminalWidth - padding);
+
+  const lines = wrapText(value, wrapWidth);
   if (lines.length <= maxLines) return value;
   return `...\n${lines.slice(lines.length - maxLines).join("\n")}`;
 }
