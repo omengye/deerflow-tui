@@ -289,7 +289,12 @@ function formatJsonish(value: string): string {
 }
 
 function truncateLines(value: string, maxLines: number): string {
-  const lines = value.split("\n");
+  const terminalWidth = getTerminalWidth();
+  // Safe margin of 12 columns to account for indentation, padding, and border.
+  const padding = 12;
+  const wrapWidth = Math.max(20, terminalWidth - padding);
+
+  const lines = wrapText(value, wrapWidth);
   if (lines.length <= maxLines) return value;
   return `${lines.slice(0, maxLines).join("\n")}\n...`;
 }
