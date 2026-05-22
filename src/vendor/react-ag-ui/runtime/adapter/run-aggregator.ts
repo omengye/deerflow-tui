@@ -646,7 +646,8 @@ export class RunAggregator {
 
     // Only splice if the text segment is found AND it is empty (has no content)
     // to prevent shifting already visible text down, which causes scroll jitter.
-    const textPart = textIndex !== -1 ? this.textParts.get(this.partOrder[textIndex].key) : undefined;
+    const part = textIndex !== -1 ? this.partOrder[textIndex] : undefined;
+    const textPart = part && part.kind === "text" ? this.textParts.get(part.key) : undefined;
     const isTextEmpty = !textPart || !textPart.buffer || textPart.buffer.length === 0;
 
     if (textIndex === -1 || !isTextEmpty) {

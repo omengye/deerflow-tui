@@ -69,6 +69,7 @@ export class AgUiThreadRuntimeCore {
   private runtime: AssistantRuntime | undefined;
   private messages: ThreadMessage[] = [];
   private isRunningFlag = false;
+  private currentRunParentId: string | null = null;
   private abortController: AbortController | null = null;
   private stateSnapshot: ReadonlyJSONValue | undefined;
   private pendingError: Error | null = null;
@@ -428,8 +429,39 @@ export class AgUiThreadRuntimeCore {
   }
 
   applyExternalMessages(messages: readonly ThreadMessage[]): void {
+    const activeRunMessages: ThreadMessage[] = [];
+    if (this.isRunningFlag) {
+      const idx = this.currentRunParentId
+        ? this.messages.findIndex((m) => m.id === this.currentRunParentId)
+        : 0;
+      if (idx !== -1) {
+        activeRunMessages.push(...this.messages.slice(idx));
+      }
+    }
+
+    const activeAssistantParents = new Map<string, string | null>();
+    for (const msg of activeRunMessages) {
+      if (msg.role === "assistant") {
+        const parent = this.assistantHistoryParents.get(msg.id);
+        if (parent !== undefined) {
+          activeAssistantParents.set(msg.id, parent);
+        }
+      }
+    }
+
     this.assistantHistoryParents.clear();
-    this.messages = [...messages];
+    for (const [id, parent] of activeAssistantParents) {
+      this.assistantHistoryParents.set(id, parent);
+    }
+
+    const newMessages = [...messages];
+    for (const activeMsg of activeRunMessages) {
+      if (!newMessages.some((m) => m.id === activeMsg.id)) {
+        newMessages.push(activeMsg);
+      }
+    }
+    this.messages = newMessages;
+
     this.recordedHistoryIds.clear();
     for (const message of this.messages) {
       this.recordedHistoryIds.add(message.id);
@@ -457,6 +489,7 @@ export class AgUiThreadRuntimeCore {
     runConfig?: RunConfig,
     resume?: AgUiResumeEntry[],
   ): Promise<void> {
+    this.currentRunParentId = parentId;
     const normalizedRunConfig = runConfig ?? {};
     this.lastRunConfig = normalizedRunConfig;
     this.resetHead(parentId);
@@ -651,6 +684,7 @@ export class AgUiThreadRuntimeCore {
     if (this.abortController === controller) {
       this.abortController = null;
     }
+    this.currentRunParentId = null;
     this.setRunning(false);
   }
 

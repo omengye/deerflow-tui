@@ -326,6 +326,7 @@ function wrapText(text: string, width: number): string[] {
     
     for (let i = 0; i < rawLine.length; i++) {
       const char = rawLine[i];
+      if (char === undefined) continue;
       const charWidth = char.charCodeAt(0) > 255 ? 2 : 1;
       
       if (currentWidth + charWidth <= width) {
