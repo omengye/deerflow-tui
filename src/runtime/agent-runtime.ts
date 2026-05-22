@@ -607,18 +607,25 @@ export function useAgentRuntime() {
     [threadId],
   );
 
-  return useAgUiRuntime({
-    agent,
-    adapters: {
+  const adapters = useMemo(
+    () => ({
       threadList: {
         threadId,
         onSwitchToNewThread: handleSwitchToNewThread,
       },
-    },
+    }),
+    [threadId, handleSwitchToNewThread],
+  );
+
+  const onError = useCallback((e: Error) => {
+    console.error("[ag-ui]", e.message);
+  }, []);
+
+  return useAgUiRuntime({
+    agent,
+    adapters,
     showThinking: true,
-    onError: (e: Error) => {
-      console.error("[ag-ui]", e.message);
-    },
+    onError,
   });
 }
 

@@ -1,12 +1,25 @@
+import { memo } from "react";
 import { Box, Text } from "ink";
 import {
   AssistantRuntimeProvider,
   ThreadPrimitive,
+  useAuiState,
 } from "@assistant-ui/react-ink";
 import { useAgentRuntime } from "./runtime/agent-runtime.js";
 import { Message } from "./components/chat/Message.js";
 import { InputBar } from "./components/composer/InputBar.js";
 import { StatusBar } from "./components/panels/StatusBar.js";
+
+const MessagesList = memo(function MessagesList() {
+  const isRunning = useAuiState((s) => s.thread.isRunning);
+  return (
+    <ThreadPrimitive.Messages
+      components={{ Message }}
+      windowSize={isRunning ? 1 : 0}
+      windowOverscan={0}
+    />
+  );
+});
 
 export function App() {
   const runtime = useAgentRuntime();
@@ -26,11 +39,7 @@ export function App() {
             </Box>
           </ThreadPrimitive.Empty>
 
-          <ThreadPrimitive.Messages
-            components={{ Message }}
-            windowSize={1}
-            windowOverscan={0}
-          />
+          <MessagesList />
         </ThreadPrimitive.Root>
 
         <StatusBar />
