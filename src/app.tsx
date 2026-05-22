@@ -26,7 +26,11 @@ export function App() {
             </Box>
           </ThreadPrimitive.Empty>
 
-          <ThreadPrimitive.Messages components={{ Message }} />
+          <ThreadPrimitive.Messages
+            components={{ Message }}
+            windowSize={1}
+            windowOverscan={0}
+          />
         </ThreadPrimitive.Root>
 
         <InputBar />
