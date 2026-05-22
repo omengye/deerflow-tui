@@ -33,8 +33,8 @@ export function App() {
           />
         </ThreadPrimitive.Root>
 
-        <InputBar />
         <StatusBar />
+        <InputBar />
       </Box>
     </AssistantRuntimeProvider>
   );
