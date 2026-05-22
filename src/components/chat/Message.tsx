@@ -252,12 +252,12 @@ function CompactToolCall({ toolCall }: { toolCall: ToolCallMessagePart }) {
       </Box>
       {args ? (
         <Text dimColor wrap="wrap">
-          args: {truncateLines(formatJsonish(args), 4)}
+          args: {truncateLines(formatJsonish(args), 4, 6)}
         </Text>
       ) : null}
       {result !== undefined ? (
         <Text wrap="wrap" color={toolCall.isError ? "red" : undefined}>
-          result: {truncateLines(formatJsonish(result), 6)}
+          result: {truncateLines(formatJsonish(result), 6, 8)}
         </Text>
       ) : null}
     </Box>
@@ -288,14 +288,14 @@ function formatJsonish(value: string): string {
   }
 }
 
-function truncateLines(value: string, maxLines: number): string {
+function truncateLines(value: string, maxLines: number, prefixLen = 0): string {
   const terminalWidth = getTerminalWidth();
-  // Safe margin of 12 columns to account for indentation, padding, and border.
-  const padding = 12;
-  const wrapWidth = Math.max(20, terminalWidth - padding);
+  // Actual box nesting: App paddingX(1)*2 + MessageBlock paddingLeft(2) + EventBlock paddingLeft(2) = 6
+  const boxPadding = 6;
+  const wrapWidth = Math.max(20, terminalWidth - boxPadding - prefixLen);
 
   const lines = wrapText(value, wrapWidth);
-  if (lines.length <= maxLines) return value;
+  if (lines.length <= maxLines) return lines.join("\n");
   return `${lines.slice(0, maxLines).join("\n")}\n...`;
 }
 
