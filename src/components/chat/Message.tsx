@@ -112,7 +112,7 @@ function renderMessagePart(part: AssistantContent[number], index: number) {
         fallbackId={`reasoning-${index + 1}`}
       >
         <Text dimColor wrap="wrap">
-          {part.text}
+          {truncateLinesKeepLast(part.text, 5)}
         </Text>
       </EventBlock>
     );
@@ -292,6 +292,12 @@ function truncateLines(value: string, maxLines: number): string {
   const lines = value.split("\n");
   if (lines.length <= maxLines) return value;
   return `${lines.slice(0, maxLines).join("\n")}\n...`;
+}
+
+function truncateLinesKeepLast(value: string, maxLines: number): string {
+  const lines = value.split("\n");
+  if (lines.length <= maxLines) return value;
+  return `...\n${lines.slice(lines.length - maxLines).join("\n")}`;
 }
 
 function shortId(value: string | undefined): string {

@@ -637,9 +637,19 @@ export class RunAggregator {
       ...(messageId ? { messageId } : {}),
     });
 
-    // ensure reasoning appears before the first text segment if possible
-    const textIndex = this.partOrder.findIndex((part) => part.kind === "text");
-    if (textIndex === -1) {
+    // ensure reasoning appears before the corresponding text segment of the same message if possible
+    const textIndex = messageId
+      ? this.partOrder.findIndex(
+          (part) => part.kind === "text" && part.key === messageId,
+        )
+      : -1;
+
+    // Only splice if the text segment is found AND it is empty (has no content)
+    // to prevent shifting already visible text down, which causes scroll jitter.
+    const textPart = textIndex !== -1 ? this.textParts.get(this.partOrder[textIndex].key) : undefined;
+    const isTextEmpty = !textPart || !textPart.buffer || textPart.buffer.length === 0;
+
+    if (textIndex === -1 || !isTextEmpty) {
       this.partOrder.push({ kind: "reasoning", key: id });
     } else {
       this.partOrder.splice(textIndex, 0, { kind: "reasoning", key: id });
