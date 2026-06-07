@@ -236,14 +236,19 @@ func (m model) View() string {
 		lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(" - AG-UI Bubble Tea rewrite")
 
 	inputLine := lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("8")).Padding(0, 1).Render(
-		lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("> ") + m.input.View(),
+		m.input.View(),
 	)
 
 	status := lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(
 		fmt.Sprintf("%s | Messages: %d | Thread: %s | %s", m.status, len(m.history), shortID(m.threadID), m.cfg.Endpoint),
 	)
 
-	return lipgloss.JoinVertical(lipgloss.Left, header, m.viewport.View(), inputLine, status)
+	frame := lipgloss.JoinVertical(lipgloss.Left, header, m.viewport.View(), inputLine, status)
+	// Clamp the frame to the terminal bounds. Any line wider than the terminal
+	// wraps and desyncs Bubble Tea's diff renderer, leaving stale content from
+	// previous frames on screen (e.g. after /new). MaxWidth truncates such lines
+	// instead of letting the terminal wrap them.
+	return lipgloss.NewStyle().MaxWidth(m.width).MaxHeight(m.height).Render(frame)
 }
 
 func (m *model) handleSubmit() tea.Cmd {
@@ -484,10 +489,13 @@ func (m *model) handleEvent(event agui.EventEnvelope) {
 	case "STATE_SNAPSHOT", "STATE_DELTA":
 		// internal state tracking only, not displayed
 
+	case "CUSTOM", "SYSTEM":
+		// custom and system events are not displayed
+
 	case "MESSAGES_SNAPSHOT":
 		m.importMessagesSnapshot(event.Raw["messages"])
 
-	case "RAW", "CUSTOM":
+	case "RAW":
 		m.appendSystemBlock(typeName, valueString(event.Raw, "source"), compactJSON(event.Raw))
 
 	default:
@@ -601,7 +609,7 @@ func (m *model) renderHistoryMessage(message agui.ChatMessage) {
 	case agui.RoleTool:
 		m.appendSystemBlock("TOOL", message.ToolCallID, messageText(message.Content))
 	case agui.RoleSystem:
-		m.appendSystemBlock("SYSTEM", message.ID, messageText(message.Content))
+		// system messages are not displayed
 	}
 }
 
@@ -987,7 +995,9 @@ func (m *model) layout() {
 	vpHeight = max(vpHeight, 3)
 	m.viewport.Width = m.width
 	m.viewport.Height = vpHeight
-	m.input.Width = max(10, m.width-8)
+	// Border (2) + horizontal padding (2) + textinput prompt/cursor (3) so the
+	// bordered input line fits exactly within the terminal width.
+	m.input.Width = max(10, m.width-7)
 }
 
 func waitForAsync(ch <-chan tea.Msg) tea.Cmd {
