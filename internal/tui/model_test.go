@@ -34,6 +34,22 @@ func TestTextMessageStreamsIntoSingleBlockAndHistory(t *testing.T) {
 	}
 }
 
+func TestTextMessageShowsAgentNameFromRawEvent(t *testing.T) {
+	m := newTestModel()
+	m.handleEvent(agui.EventEnvelope{Type: "TEXT_MESSAGE_START", MessageID: "m1", Raw: map[string]any{"type": "TEXT_MESSAGE_START", "messageId": "m1"}})
+	m.handleEvent(agui.EventEnvelope{Type: "TEXT_MESSAGE_CONTENT", MessageID: "m1", Raw: map[string]any{"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "raw_event": map[string]any{"name": "researcher"}}})
+	m.handleEvent(agui.EventEnvelope{Type: "TEXT_MESSAGE_CONTENT", MessageID: "m1", Delta: "hello", Raw: map[string]any{"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "hello"}})
+
+	if got := m.renderBlocks(); !strings.Contains(got, "[TEXT_MESSAGE] #m1 agent: researcher") || !strings.Contains(got, "hello") {
+		t.Fatalf("agent name not rendered in text message block:\n%s", got)
+	}
+
+	m.handleEvent(agui.EventEnvelope{Type: "TEXT_MESSAGE_END", MessageID: "m1", Raw: map[string]any{"type": "TEXT_MESSAGE_END", "messageId": "m1"}})
+	if len(m.history) != 1 || m.history[0].Name != "researcher" {
+		t.Fatalf("agent name not recorded in history: %#v", m.history)
+	}
+}
+
 func TestReplayFilterDropsHistoricalTextByID(t *testing.T) {
 	m := newTestModel()
 	m.history = []agui.ChatMessage{{Role: agui.RoleAssistant, ID: "m1", Content: "already shown"}}
@@ -167,7 +183,10 @@ func TestMessagesSnapshotImportsHistory(t *testing.T) {
 		t.Fatalf("expected user + assistant history after tool result attachment, got %s", b)
 	}
 	got := m.renderBlocks()
-	if !strings.Contains(got, "hello") || !strings.Contains(got, "lookup") || !strings.Contains(got, "imported 2 messages") {
+	if !strings.Contains(got, "hello") || !strings.Contains(got, "lookup") {
 		t.Fatalf("snapshot not rendered correctly:\n%s", got)
+	}
+	if strings.Contains(got, "MESSAGES_SNAPSHOT") || strings.Contains(got, "imported 2 messages") || strings.Contains(got, "[SYSTEM]") {
+		t.Fatalf("snapshot event should not be rendered:\n%s", got)
 	}
 }

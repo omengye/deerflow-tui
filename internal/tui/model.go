@@ -90,6 +90,7 @@ type model struct {
 	asyncCh         chan tea.Msg
 	replay          replayState
 	textBuffers     map[string]*strings.Builder
+	textAgentNames  map[string]string
 	activeTextID    string
 	textPartCounter int
 	reasoningBuffer map[string]*strings.Builder
@@ -121,6 +122,7 @@ func NewModel(cfg config.Config) tea.Model {
 		blockIndexes:     map[string]int{},
 		replay:           newReplayState(nil),
 		textBuffers:      map[string]*strings.Builder{},
+		textAgentNames:   map[string]string{},
 		reasoningBuffer:  map[string]*strings.Builder{},
 		toolBuffers:      map[string]*toolCallBuffer{},
 		selectedBlockIdx: -1,
@@ -370,36 +372,47 @@ func (m *model) handleEvent(event agui.EventEnvelope) {
 		if m.shouldIgnoreTextStart(id) {
 			return
 		}
+		m.recordTextAgentName(id, event)
 		m.ensureTextBuffer(id)
-		m.upsertBlock(textBlockKey(id), eventHeader("TEXT_MESSAGE", id), "")
+		m.upsertBlock(textBlockKey(id), m.textMessageHeader(id), "")
 
 	case "TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_CHUNK":
 		id := m.resolveTextID(event.MessageID, false)
-		if m.shouldIgnoreTextContent(id) || event.Delta == "" {
+		if m.shouldIgnoreTextContent(id) {
+			return
+		}
+		m.recordTextAgentName(id, event)
+		if event.Delta == "" {
+			if buf, ok := m.textBuffers[id]; ok {
+				m.upsertBlock(textBlockKey(id), m.textMessageHeader(id), buf.String())
+			}
 			return
 		}
 		buf := m.ensureTextBuffer(id)
 		buf.WriteString(event.Delta)
-		m.upsertBlock(textBlockKey(id), eventHeader("TEXT_MESSAGE", id), buf.String())
+		m.upsertBlock(textBlockKey(id), m.textMessageHeader(id), buf.String())
 
 	case "TEXT_MESSAGE_END":
 		id := m.resolveTextID(event.MessageID, false)
 		if m.finishIgnoredText(id) {
 			return
 		}
+		m.recordTextAgentName(id, event)
 		buf := m.ensureTextBuffer(id)
 		text := strings.TrimSpace(buf.String())
 		filtered := m.replay.filterReplayText(text)
 		if filtered == "" {
 			m.removeBlock(textBlockKey(id))
 			delete(m.textBuffers, id)
+			delete(m.textAgentNames, id)
 			m.clearActiveText(id)
 			return
 		}
-		m.upsertBlock(textBlockKey(id), eventHeader("TEXT_MESSAGE", id), filtered)
-		m.history = append(m.history, agui.ChatMessage{Role: agui.RoleAssistant, Content: filtered, ID: id})
+		m.upsertBlock(textBlockKey(id), m.textMessageHeader(id), filtered)
+		m.history = append(m.history, agui.ChatMessage{Role: agui.RoleAssistant, Content: filtered, ID: id, Name: m.textAgentNames[id]})
 		m.replay.completedTextMessageID[id] = struct{}{}
 		delete(m.textBuffers, id)
+		delete(m.textAgentNames, id)
 		m.clearActiveText(id)
 
 	case "THINKING_START", "THINKING_TEXT_MESSAGE_START":
@@ -589,7 +602,6 @@ func (m *model) importMessagesSnapshot(raw any) {
 	for _, message := range messages {
 		m.renderHistoryMessage(message)
 	}
-	m.appendSystemBlock("SYSTEM", "", fmt.Sprintf("imported %d messages", len(messages)))
 }
 
 func (m *model) renderHistoryMessage(message agui.ChatMessage) {
@@ -599,7 +611,7 @@ func (m *model) renderHistoryMessage(message agui.ChatMessage) {
 	case agui.RoleAssistant:
 		text := messageText(message.Content)
 		if text != "" {
-			m.appendChatBlock("Assistant", message.ID, text)
+			m.appendChatBlock(speakerWithName("Assistant", message.Name), message.ID, text)
 		}
 		for _, call := range message.ToolCalls {
 			buf := &toolCallBuffer{id: call.ID, name: call.Function.Name}
@@ -698,6 +710,20 @@ func (m *model) appendChatBlock(speaker, id, text string) {
 
 func (m *model) appendSystemBlock(eventType, id, detail string) {
 	m.appendBlock(displayBlock{header: eventHeader(eventType, id), content: strings.TrimSpace(detail)})
+}
+
+func (m *model) recordTextAgentName(id string, event agui.EventEnvelope) {
+	if id == "" {
+		return
+	}
+	name := eventAgentName(event.Raw)
+	if name != "" {
+		m.textAgentNames[id] = name
+	}
+}
+
+func (m *model) textMessageHeader(id string) string {
+	return headerWithAgent(eventHeader("TEXT_MESSAGE", id), m.textAgentNames[id])
 }
 
 func (m *model) appendBlock(block displayBlock) {
@@ -875,6 +901,7 @@ func (m *model) finishIgnoredText(id string) bool {
 	}
 	delete(m.replay.ignoredTextMessageIDs, id)
 	delete(m.textBuffers, id)
+	delete(m.textAgentNames, id)
 	m.removeBlock(textBlockKey(id))
 	m.clearActiveText(id)
 	return true
@@ -888,10 +915,11 @@ func (m *model) finalizeRun() {
 			m.removeBlock(textBlockKey(id))
 			continue
 		}
-		m.upsertBlock(textBlockKey(id), eventHeader("TEXT_MESSAGE", id), text)
-		m.history = append(m.history, agui.ChatMessage{Role: agui.RoleAssistant, Content: text, ID: id})
+		m.upsertBlock(textBlockKey(id), m.textMessageHeader(id), text)
+		m.history = append(m.history, agui.ChatMessage{Role: agui.RoleAssistant, Content: text, ID: id, Name: m.textAgentNames[id]})
 	}
 	m.textBuffers = map[string]*strings.Builder{}
+	m.textAgentNames = map[string]string{}
 	m.activeTextID = ""
 
 	// Flush reasoning
@@ -940,6 +968,7 @@ func (m *model) beginRun(history []agui.ChatMessage) uint64 {
 
 func (m *model) resetRunBuffers() {
 	m.textBuffers = map[string]*strings.Builder{}
+	m.textAgentNames = map[string]string{}
 	m.activeTextID = ""
 	m.reasoningBuffer = map[string]*strings.Builder{}
 	m.activeReasonID = ""
@@ -1140,6 +1169,45 @@ func eventHeader(eventType, id string) string {
 		return fmt.Sprintf("[%s]", eventType)
 	}
 	return fmt.Sprintf("[%s] #%s", eventType, shortID(id))
+}
+
+func headerWithAgent(header, agentName string) string {
+	agentName = cleanDisplayName(agentName)
+	if agentName == "" {
+		return header
+	}
+	return fmt.Sprintf("%s agent: %s", header, agentName)
+}
+
+func speakerWithName(speaker, name string) string {
+	name = cleanDisplayName(name)
+	if name == "" {
+		return speaker
+	}
+	return fmt.Sprintf("%s (%s)", speaker, name)
+}
+
+func eventAgentName(raw map[string]any) string {
+	return nestedString(raw, "raw_event", "name")
+}
+
+func nestedString(raw map[string]any, key, nestedKey string) string {
+	if raw == nil {
+		return ""
+	}
+	obj, ok := raw[key].(map[string]any)
+	if !ok {
+		return ""
+	}
+	value, ok := obj[nestedKey].(string)
+	if !ok {
+		return ""
+	}
+	return value
+}
+
+func cleanDisplayName(name string) string {
+	return strings.Join(strings.Fields(name), " ")
 }
 
 func textBlockKey(id string) string {
