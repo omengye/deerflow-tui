@@ -2,9 +2,12 @@ package tui
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
 
 	"deerflow-tui/internal/agui"
 	"deerflow-tui/internal/config"
@@ -98,6 +101,40 @@ func TestStaleRunMessagesAreIgnored(t *testing.T) {
 	}
 }
 
+func TestStaleAsyncMessageKeepsCurrentStreamWaitAlive(t *testing.T) {
+	errTestStream := errors.New("stale stream error")
+	cases := map[string]tea.Msg{
+		"event": aguiEventMsg{runSeq: 1, event: agui.EventEnvelope{Type: "TEXT_MESSAGE_CONTENT", MessageID: "stale", Delta: "bad", Raw: map[string]any{"type": "TEXT_MESSAGE_CONTENT"}}},
+		"error": aguiErrorMsg{runSeq: 1, err: errTestStream},
+		"done":  streamDoneMsg{runSeq: 1},
+	}
+
+	for name, stale := range cases {
+		t.Run(name, func(t *testing.T) {
+			m := newTestModel()
+			m.runSeq = 2
+			m.running = true
+			m.stream = &agui.Stream{}
+			m.asyncCh <- aguiEventMsg{runSeq: 2, event: agui.EventEnvelope{Type: "TEXT_MESSAGE_START", MessageID: "current", Raw: map[string]any{"type": "TEXT_MESSAGE_START", "messageId": "current"}}}
+
+			updated, cmd := m.Update(stale)
+			m = updated.(model)
+
+			if cmd == nil {
+				t.Fatal("expected stale async message to keep waiting on the active stream")
+			}
+			got := runCmd(t, cmd)
+			current, ok := got.(aguiEventMsg)
+			if !ok || current.runSeq != 2 || current.event.MessageID != "current" {
+				t.Fatalf("expected next current stream message, got %#v", got)
+			}
+			if rendered := m.renderBlocks(); strings.Contains(rendered, "bad") {
+				t.Fatalf("stale event was rendered:\n%s", rendered)
+			}
+		})
+	}
+}
+
 func TestInterruptResumeEntriesValidateAndRender(t *testing.T) {
 	m := newTestModel()
 	expiresAt := time.Now().Add(time.Hour).Format(time.RFC3339)
@@ -178,15 +215,33 @@ func TestMessagesSnapshotImportsHistory(t *testing.T) {
 	}
 	m.handleEvent(agui.EventEnvelope{Type: "MESSAGES_SNAPSHOT", Raw: map[string]any{"type": "MESSAGES_SNAPSHOT", "messages": raw}})
 
-	if len(m.history) != 2 {
+	if len(m.history) != 3 {
 		b, _ := json.Marshal(m.history)
-		t.Fatalf("expected user + assistant history after tool result attachment, got %s", b)
+		t.Fatalf("expected user + assistant + tool history, got %s", b)
+	}
+	if m.history[2].Role != agui.RoleTool || m.history[2].ToolCallID != "tc1" {
+		t.Fatalf("tool result missing from imported history: %#v", m.history)
 	}
 	got := m.renderBlocks()
-	if !strings.Contains(got, "hello") || !strings.Contains(got, "lookup") {
+	if !strings.Contains(got, "hello") || !strings.Contains(got, "lookup") || !strings.Contains(got, `{"result":1}`) {
 		t.Fatalf("snapshot not rendered correctly:\n%s", got)
 	}
 	if strings.Contains(got, "MESSAGES_SNAPSHOT") || strings.Contains(got, "imported 2 messages") || strings.Contains(got, "[SYSTEM]") {
 		t.Fatalf("snapshot event should not be rendered:\n%s", got)
+	}
+}
+
+func runCmd(t *testing.T, cmd tea.Cmd) tea.Msg {
+	t.Helper()
+	done := make(chan tea.Msg, 1)
+	go func() {
+		done <- cmd()
+	}()
+	select {
+	case msg := <-done:
+		return msg
+	case <-time.After(time.Second):
+		t.Fatal("command did not return")
+		return nil
 	}
 }

@@ -36,3 +36,19 @@ func TestParseEventEnvelopeNormalizesNestedRoles(t *testing.T) {
 		t.Fatalf("input message role = %#v", inputMessages[0])
 	}
 }
+
+func TestMessagesFromSnapshotPreservesToolResults(t *testing.T) {
+	messages := MessagesFromSnapshot([]any{
+		map[string]any{"id": "a1", "role": "assistant", "content": "", "toolCalls": []any{
+			map[string]any{"id": "tc1", "function": map[string]any{"name": "lookup", "arguments": `{"q":"x"}`}},
+		}},
+		map[string]any{"id": "t1", "role": "tool", "toolCallId": "tc1", "content": `{"ok":true}`},
+	})
+
+	if len(messages) != 2 {
+		t.Fatalf("expected assistant and tool messages, got %#v", messages)
+	}
+	if messages[1].Role != RoleTool || messages[1].ToolCallID != "tc1" || messages[1].Content != `{"ok":true}` {
+		t.Fatalf("tool result was not preserved: %#v", messages[1])
+	}
+}

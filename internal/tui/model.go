@@ -187,6 +187,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case aguiEventMsg:
 		if msg.runSeq != m.runSeq {
+			if m.stream != nil {
+				cmds = append(cmds, waitForAsync(m.asyncCh))
+			}
 			break
 		}
 		m.handleEvent(msg.event)
@@ -194,6 +197,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case aguiErrorMsg:
 		if msg.runSeq != m.runSeq {
+			if m.stream != nil {
+				cmds = append(cmds, waitForAsync(m.asyncCh))
+			}
 			break
 		}
 		m.starting = false
@@ -204,6 +210,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case streamDoneMsg:
 		if msg.runSeq != m.runSeq {
+			if m.stream != nil {
+				cmds = append(cmds, waitForAsync(m.asyncCh))
+			}
 			break
 		}
 		m.starting = false

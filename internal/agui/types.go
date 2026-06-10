@@ -263,11 +263,6 @@ func MessagesFromSnapshot(raw any) []ChatMessage {
 		if !ok {
 			continue
 		}
-		if message.Role == RoleTool {
-			if attachToolResult(converted, message) {
-				continue
-			}
-		}
 		converted = append(converted, message)
 	}
 	return converted
@@ -330,24 +325,6 @@ func toolCallsFromSnapshot(raw map[string]any) []ToolCall {
 		calls = append(calls, NewToolCall(id, name, args))
 	}
 	return calls
-}
-
-func attachToolResult(messages []ChatMessage, toolMessage ChatMessage) bool {
-	if toolMessage.ToolCallID == "" {
-		return false
-	}
-	for index := len(messages) - 1; index >= 0; index-- {
-		message := &messages[index]
-		if message.Role != RoleAssistant {
-			continue
-		}
-		for _, call := range message.ToolCalls {
-			if call.ID == toolMessage.ToolCallID {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func firstString(raw map[string]any, keys ...string) string {
