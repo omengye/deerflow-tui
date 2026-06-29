@@ -327,6 +327,19 @@ func toolCallsFromSnapshot(raw map[string]any) []ToolCall {
 	return calls
 }
 
+// CancelRunResponse is the response from POST /api/runs/{id}/cancel.
+type CancelRunResponse struct {
+	Success bool             `json:"success"`
+	Run     CancelRunStatus  `json:"run"`
+}
+
+// CancelRunStatus is the run status returned in a cancel response.
+type CancelRunStatus struct {
+	RunID     string `json:"run_id"`
+	ThreadID  string `json:"thread_id"`
+	Status    string `json:"status"`
+}
+
 func firstString(raw map[string]any, keys ...string) string {
 	for _, key := range keys {
 		if value, ok := raw[key].(string); ok {

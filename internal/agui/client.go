@@ -15,6 +15,7 @@ import (
 )
 
 type Stream struct {
+	RunID  string
 	Events <-chan EventEnvelope
 	Errs   <-chan error
 	cancel context.CancelFunc
@@ -27,10 +28,11 @@ func (s *Stream) Close() {
 }
 
 type Client struct {
-	endpoint     string
-	headers      map[string]string
-	initialState map[string]any
-	httpClient   *http.Client
+	endpoint      string
+	cancelBaseURL string
+	headers       map[string]string
+	initialState  map[string]any
+	httpClient    *http.Client
 }
 
 func NewClient(endpoint string, headers map[string]string, initialState map[string]any) *Client {
@@ -44,11 +46,25 @@ func NewClient(endpoint string, headers map[string]string, initialState map[stri
 	}
 
 	return &Client{
-		endpoint:     endpoint,
-		headers:      clonedHeaders,
-		initialState: clonedState,
-		httpClient:   &http.Client{Timeout: 0},
+		endpoint:      endpoint,
+		cancelBaseURL: deriveCancelBaseURL(endpoint),
+		headers:       clonedHeaders,
+		initialState:  clonedState,
+		httpClient:    &http.Client{Timeout: 0},
 	}
+}
+
+func deriveCancelBaseURL(endpoint string) string {
+	// Strip the AG-UI path suffix to get the API base.
+	// "http://host:8000/api/chat/agui" → "http://host:8000/api"
+	if idx := strings.LastIndex(endpoint, "/chat/agui"); idx >= 0 {
+		return endpoint[:idx]
+	}
+	// "http://host:8000/agent" → "http://host:8000/api"
+	if idx := strings.LastIndex(endpoint, "/"); idx > len("http://") {
+		return endpoint[:idx] + "/api"
+	}
+	return endpoint + "/api"
 }
 
 func (c *Client) StartRun(ctx context.Context, threadID string, history []ChatMessage) (*Stream, error) {
@@ -141,7 +157,33 @@ func (c *Client) ResumeRun(ctx context.Context, threadID string, history []ChatM
 		}
 	}()
 
-	return &Stream{Events: events, Errs: errs, cancel: cancel}, nil
+	return &Stream{RunID: runID, Events: events, Errs: errs, cancel: cancel}, nil
+}
+
+func (c *Client) CancelRun(ctx context.Context, runID string) error {
+	url := fmt.Sprintf("%s/runs/%s/cancel", c.cancelBaseURL, runID)
+	body := strings.NewReader(`{"action":"interrupt"}`)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
+	if err != nil {
+		return fmt.Errorf("create cancel request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range c.headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("cancel run request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 32*1024))
+		return fmt.Errorf("cancel run failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	return nil
 }
 
 func parseSSE(r io.Reader, onData func(data string)) error {

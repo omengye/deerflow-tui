@@ -78,6 +78,8 @@ type model struct {
 	running  bool
 	runSeq   uint64
 
+	activeRunID string
+
 	blocks           []displayBlock
 	blockIndexes     map[string]int
 	history          []agui.ChatMessage
@@ -179,6 +181,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.stream = msg.stream
+		m.activeRunID = msg.stream.RunID
 		m.starting = false
 		m.running = true
 		m.status = "Running"
@@ -274,6 +277,7 @@ func (m *model) handleSubmit() tea.Cmd {
 		m.stopStream()
 		return tea.Quit
 	case "/cancel":
+		m.cancelServerRun()
 		m.stopStream()
 		m.clearInterrupts()
 		m.status = "Idle (cancelled)"
@@ -963,7 +967,19 @@ func (m *model) stopStream() {
 	}
 	m.starting = false
 	m.running = false
+	m.activeRunID = ""
 	m.finalizeRun()
+}
+
+func (m *model) cancelServerRun() {
+	if m.activeRunID == "" {
+		return
+	}
+	go func(runID string) {
+		if err := m.client.CancelRun(context.Background(), runID); err != nil {
+			m.asyncCh <- aguiErrorMsg{runSeq: m.runSeq, err: fmt.Errorf("server cancel failed: %w", err)}
+		}
+	}(m.activeRunID)
 }
 
 func (m *model) beginRun(history []agui.ChatMessage) uint64 {

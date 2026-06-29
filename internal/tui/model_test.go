@@ -245,3 +245,30 @@ func runCmd(t *testing.T, cmd tea.Cmd) tea.Msg {
 		return nil
 	}
 }
+
+func TestCancelCommandResetsActiveRunID(t *testing.T) {
+	m := newTestModel()
+	m.activeRunID = "test-run-1"
+	m.running = true
+	m.stream = &agui.Stream{RunID: "test-run-1"}
+
+	m.input.SetValue("/cancel")
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+
+	if m.activeRunID != "" {
+		t.Fatalf("expected activeRunID to be cleared after /cancel, got %q", m.activeRunID)
+	}
+	if m.running {
+		t.Fatal("expected running=false after /cancel")
+	}
+	if m.status != "Idle (cancelled)" {
+		t.Fatalf("expected status 'Idle (cancelled)', got %q", m.status)
+	}
+}
+
+func TestCancelServerRunNoopWhenNoActiveRun(t *testing.T) {
+	m := newTestModel()
+	m.activeRunID = ""
+	m.cancelServerRun()
+}
