@@ -1,112 +1,91 @@
-# Linux SEA build for deerflow-tui
+# Go build and packaging targets for deerflow-tui.
 #
-# Why this Makefile exists:
-#   Distro-shipped node binaries (apt/dnf/snap/strip-ed images) often have
-#   non-standard ELF section layouts. postject's blob injection then corrupts
-#   .dynamic/.rela.* and the binary segfaults inside ld-linux's
-#   _dl_relocate_object before main() runs. Building against the official
-#   nodejs.org tarball avoids that.
-#
-# Usage:
-#   make                  # full build: download node + bundle + blob + inject
-#   make run              # build then run ./dist-sea/deerflow-tui
-#   make clean            # remove build artifacts (keep downloaded node)
-#   make distclean        # also remove .cache/node-*
-#   make NODE_VERSION=v24.14.0
-#   make NODE_ARCH=arm64
+# Common commands:
+#   make test
+#   make build
+#   make package VERSION=v1.0.0
+#   make clean
 
 SHELL := /usr/bin/env bash
 .SHELLFLAGS := -eu -o pipefail -c
 .DEFAULT_GOAL := package
 
-NODE_VERSION ?= v24.14.0
-NODE_ARCH    ?= x64
-NODE_PLATFORM = linux-$(NODE_ARCH)
-NODE_TARBALL  = node-$(NODE_VERSION)-$(NODE_PLATFORM).tar.xz
-NODE_URL      = https://nodejs.org/dist/$(NODE_VERSION)/$(NODE_TARBALL)
+APP_NAME := deerflow-tui
+CMD := ./cmd/deerflow-tui
 
-CACHE_DIR    := .cache
-NODE_DIR     := $(CACHE_DIR)/node-$(NODE_VERSION)-$(NODE_PLATFORM)
-NODE_BIN     := $(abspath $(NODE_DIR)/bin/node)
+VERSION ?= dev
+GO ?= go
+GOARCH := amd64
+CGO_ENABLED ?= 0
 
-OUT_DIR      := dist-sea
-BIN_NAME     := deerflow-tui
-BUNDLE       := $(OUT_DIR)/entry.mjs
-BLOB         := $(OUT_DIR)/$(BIN_NAME).blob
-TARGET_BIN   := $(OUT_DIR)/$(BIN_NAME)
-POSTJECT     := node_modules/.bin/postject
-SEA_FUSE     := NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
+DIST_DIR := dist
+BUILD_DIR := $(DIST_DIR)/build
+STAGE_DIR := $(DIST_DIR)/stage
+PACKAGE_DIR := $(DIST_DIR)/packages
 
-.PHONY: package run check node deps bundle blob inject clean distclean
+GO_BUILD_FLAGS := -trimpath
+LD_FLAGS := -s -w -X main.Version=$(VERSION)
 
-# Top-level: builds the SEA binary
-package: $(TARGET_BIN)
-	@echo
-	@echo "✔ Built $(TARGET_BIN)"
-	@ls -lh $(TARGET_BIN)
+LINUX_NAME := $(APP_NAME)-$(VERSION)-linux-amd64
+WINDOWS_NAME := $(APP_NAME)-$(VERSION)-windows-amd64
 
-run: package
-	@./$(TARGET_BIN)
+.PHONY: help test run build build-linux build-windows package package-linux package-windows checksums clean
 
-# 1. Download official node tarball
-$(NODE_BIN):
-	@echo "→ Fetching $(NODE_TARBALL)"
-	@mkdir -p $(CACHE_DIR)
-	@if ! command -v curl >/dev/null; then \
-		echo "curl required" >&2; exit 1; \
-	fi
-	@curl -fL --retry 3 -o $(CACHE_DIR)/$(NODE_TARBALL) $(NODE_URL)
-	@tar -xJf $(CACHE_DIR)/$(NODE_TARBALL) -C $(CACHE_DIR)
-	@test -x $(NODE_BIN)
-	@$(NODE_BIN) -v
+help:
+	@printf '%s\n' \
+		'Targets:' \
+		'  make test                 Run Go tests' \
+		'  make run                  Run the TUI locally' \
+		'  make build                Build linux/windows amd64 binaries' \
+		'  make package VERSION=vX.Y  Build tar.gz/zip packages and SHA256SUMS' \
+		'  make clean                Remove generated dist files'
 
-node: $(NODE_BIN)
+test:
+	$(GO) test ./...
 
-# 2. pnpm deps (only re-runs if lockfile changed)
-node_modules/.pkg-stamp: package.json pnpm-lock.yaml
-	@if ! command -v pnpm >/dev/null; then \
-		echo "pnpm required (https://pnpm.io)" >&2; exit 1; \
-	fi
-	@pnpm install --frozen-lockfile
-	@touch $@
+run:
+	$(GO) run $(CMD)
 
-deps: node_modules/.pkg-stamp
+build: build-linux build-windows
 
-# 3. tsup bundle — PATH-prefix forces tools to resolve official node
-$(BUNDLE): node_modules/.pkg-stamp tsup.sea.config.ts $(shell find src -type f 2>/dev/null) $(NODE_BIN)
-	@echo "→ Bundling with $(NODE_BIN)"
-	@PATH="$(dir $(NODE_BIN)):$$PATH" pnpm exec tsup --config tsup.sea.config.ts
+build-linux:
+	@mkdir -p "$(BUILD_DIR)/linux-amd64"
+	CGO_ENABLED=$(CGO_ENABLED) GOOS=linux GOARCH=$(GOARCH) \
+		$(GO) build $(GO_BUILD_FLAGS) -ldflags "$(LD_FLAGS)" \
+		-o "$(BUILD_DIR)/linux-amd64/$(APP_NAME)" "$(CMD)"
 
-bundle: $(BUNDLE)
+build-windows:
+	@mkdir -p "$(BUILD_DIR)/windows-amd64"
+	CGO_ENABLED=$(CGO_ENABLED) GOOS=windows GOARCH=$(GOARCH) \
+		$(GO) build $(GO_BUILD_FLAGS) -ldflags "$(LD_FLAGS)" \
+		-o "$(BUILD_DIR)/windows-amd64/$(APP_NAME).exe" "$(CMD)"
 
-# 4. SEA blob — run blob generator under the same official node
-$(BLOB): $(BUNDLE) sea-config.json scripts/sea-bootstrap.cjs
-	@echo "→ Generating SEA blob"
-	@PATH="$(dir $(NODE_BIN)):$$PATH" $(NODE_BIN) --experimental-sea-config sea-config.json
+package: checksums
 
-blob: $(BLOB)
+package-linux: build-linux
+	@mkdir -p "$(PACKAGE_DIR)"
+	@stage="$(STAGE_DIR)/$(LINUX_NAME)"; \
+		rm -rf "$$stage"; \
+		mkdir -p "$$stage"; \
+		cp "$(BUILD_DIR)/linux-amd64/$(APP_NAME)" "$$stage/"; \
+		cp README.md LICENSE .env.example "$$stage/"; \
+		tar -C "$(STAGE_DIR)" -czf "$(PACKAGE_DIR)/$(LINUX_NAME).tar.gz" "$(LINUX_NAME)"; \
+		echo "Created $(PACKAGE_DIR)/$(LINUX_NAME).tar.gz"
 
-# 5. Postject injection — driven by package-linux-sea.sh so all logic
-#    (cp, postject, chmod) stays in one place. NODE_BIN forces the script
-#    to copy the official node binary instead of $(command -v node).
-$(TARGET_BIN): $(BLOB) scripts/package-linux-sea.sh $(NODE_BIN) | check
-	@NODE_BIN=$(NODE_BIN) OUT_DIR=$(OUT_DIR) BIN_NAME=$(BIN_NAME) \
-		bash scripts/package-linux-sea.sh
+package-windows: build-windows
+	@command -v zip >/dev/null || { echo "zip is required for Windows packages" >&2; exit 1; }
+	@mkdir -p "$(PACKAGE_DIR)"
+	@stage="$(STAGE_DIR)/$(WINDOWS_NAME)"; \
+		rm -rf "$$stage"; \
+		mkdir -p "$$stage"; \
+		cp "$(BUILD_DIR)/windows-amd64/$(APP_NAME).exe" "$$stage/"; \
+		cp README.md LICENSE .env.example "$$stage/"; \
+		(cd "$(STAGE_DIR)" && zip -qr "../packages/$(WINDOWS_NAME).zip" "$(WINDOWS_NAME)"); \
+		echo "Created $(PACKAGE_DIR)/$(WINDOWS_NAME).zip"
 
-inject: $(TARGET_BIN)
-
-# Environment sanity
-check:
-	@if [ "$$(uname -s)" != "Linux" ]; then \
-		echo "This Makefile must run on Linux." >&2; exit 1; \
-	fi
-	@if [ ! -x $(POSTJECT) ]; then \
-		echo "$(POSTJECT) missing; run 'make deps' first." >&2; exit 1; \
-	fi
+checksums: package-linux package-windows
+	@cd "$(PACKAGE_DIR)" && sha256sum *.tar.gz *.zip > SHA256SUMS
+	@echo "Created $(PACKAGE_DIR)/SHA256SUMS"
 
 clean:
-	@rm -rf $(OUT_DIR)
-	@rm -f node_modules/.pkg-stamp
-
-distclean: clean
-	@rm -rf $(CACHE_DIR)
+	rm -rf "$(DIST_DIR)"

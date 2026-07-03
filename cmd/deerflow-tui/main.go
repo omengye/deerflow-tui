@@ -11,6 +11,9 @@ import (
 	"deerflow-tui/internal/tui"
 )
 
+// Version is set by release builds.
+var Version = "dev"
+
 func main() {
 	// Load .env file if it exists (best-effort)
 	_ = godotenv.Load()

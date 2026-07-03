@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version used in package names for manual builds
+        required: false
+        default: dev
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Build release packages
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version || 'dev' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Package
+        run: make package VERSION="${VERSION}"
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deerflow-tui-${{ env.VERSION }}-amd64
+          path: dist/packages/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" dist/packages/* --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" dist/packages/* \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi
