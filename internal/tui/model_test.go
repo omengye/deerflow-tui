@@ -616,11 +616,101 @@ func TestWindowsPasteProbeTimeoutReplaysBufferedInput(t *testing.T) {
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("partial")})
 	m = updated.(model)
 	token := m.terminalPaste.timeoutToken
+	m.terminalPaste.lastActivity = time.Now().Add(-terminalPasteIdleWait)
 
 	updated, _ = m.Update(terminalPasteTimeoutMsg{probeID: probeID, token: token})
 	m = updated.(model)
 	if m.terminalPaste != nil || len(m.pastes) != 0 || m.input.Value() != "partial" {
 		t.Fatalf("timed-out paste probe did not replay buffered input: capture=%#v pastes=%#v input=%q", m.terminalPaste, m.pastes, m.input.Value())
+	}
+}
+
+func TestMouseWheelAtBottomNeverMutatesInput(t *testing.T) {
+	m := newTestModel()
+	for i := range 80 {
+		m.appendSystemBlock("LINE", fmt.Sprintf("%d", i), fmt.Sprintf("content %d", i))
+	}
+	m.refreshViewport()
+	m.viewport.GotoBottom()
+	m.input.SetValue("")
+	m.terminalPaste = &terminalPasteCapture{
+		id:           99,
+		timeoutToken: 7,
+		expected:     "unexpected data\nsecond line",
+		expectedSet:  true,
+		buffered: []tea.KeyMsg{{
+			Type:  tea.KeyRunes,
+			Runes: []rune("unexpected data"),
+		}},
+	}
+
+	updated, _ := m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown, Action: tea.MouseActionPress})
+	m = updated.(model)
+	if m.input.Value() != "" {
+		t.Fatalf("mouse wheel replayed pending data into input: %q", m.input.Value())
+	}
+	if m.terminalPaste != nil || len(m.deferredInput) != 1 {
+		t.Fatalf("mouse wheel did not safely defer stale paste capture: capture=%#v deferred=%#v", m.terminalPaste, m.deferredInput)
+	}
+
+	// The already-scheduled timeout must become stale after mouse interaction.
+	updated, _ = m.Update(terminalPasteTimeoutMsg{probeID: 99, token: 7})
+	m = updated.(model)
+	updated, _ = m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown, Action: tea.MouseActionPress})
+	m = updated.(model)
+	if m.input.Value() != "" {
+		t.Fatalf("stale paste timeout or repeated wheel changed input: %q", m.input.Value())
+	}
+
+	// Deferred keyboard data is preserved, but only a later keyboard action may
+	// restore it; mouse scrolling itself remains side-effect free.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("!")})
+	m = updated.(model)
+	if m.input.Value() != "unexpected data!" {
+		t.Fatalf("deferred input was not restored on the next keyboard action: %q", m.input.Value())
+	}
+}
+
+func TestViewportNavigationKeysDoNotReachInput(t *testing.T) {
+	m := newTestModel()
+	for i := range 80 {
+		m.appendSystemBlock("LINE", fmt.Sprintf("%d", i), fmt.Sprintf("content %d", i))
+	}
+	m.followOutput = false
+	m.refreshViewport()
+	m.viewport.GotoTop()
+	m.input.SetValue("draft")
+	m.input.SetCursor(2)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(model)
+	if m.input.Value() != "draft" || m.input.Position() != 2 {
+		t.Fatalf("viewport navigation changed input: value=%q cursor=%d", m.input.Value(), m.input.Position())
+	}
+	if m.viewport.YOffset == 0 {
+		t.Fatal("down key did not reach viewport")
+	}
+}
+
+func TestSlowNullPreludeDoesNotCaptureChineseInput(t *testing.T) {
+	m := newTestModel()
+	m.windowsPasteCaptureEnabled = true
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{0}})
+	m = updated.(model)
+	probeID := m.terminalPaste.id
+	m.terminalPaste.startedAt = time.Now().Add(-terminalPasteFirstKeyWait - time.Millisecond)
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("中文")})
+	m = updated.(model)
+	if m.terminalPaste != nil || m.input.Value() != "中文" {
+		t.Fatalf("slow null prelude captured normal Chinese input: capture=%#v input=%q", m.terminalPaste, m.input.Value())
+	}
+
+	updated, _ = m.Update(clipboardPasteMsg{probeID: probeID, content: "clipboard\ntext"})
+	m = updated.(model)
+	if m.input.Value() != "中文" {
+		t.Fatalf("stale clipboard response changed Chinese input: %q", m.input.Value())
 	}
 }
 

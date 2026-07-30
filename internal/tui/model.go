@@ -28,11 +28,11 @@ import (
 )
 
 const (
-	emptyThreadText         = "(No messages yet. Type to start.)"
-	selectionScrollInterval = 50 * time.Millisecond
-	terminalPasteProbeWait  = 1500 * time.Millisecond
-	terminalPasteBaseWait   = 2 * time.Second
-	terminalPasteMaxWait    = 45 * time.Second
+	emptyThreadText           = "(No messages yet. Type to start.)"
+	selectionScrollInterval   = 50 * time.Millisecond
+	terminalPasteProbeWait    = 1500 * time.Millisecond
+	terminalPasteFirstKeyWait = 150 * time.Millisecond
+	terminalPasteIdleWait     = 250 * time.Millisecond
 )
 
 var (
@@ -98,6 +98,8 @@ type terminalPasteTimeoutMsg struct {
 type terminalPasteCapture struct {
 	id           uint64
 	timeoutToken uint64
+	startedAt    time.Time
+	lastActivity time.Time
 	expected     string
 	expectedSet  bool
 	received     string
@@ -175,6 +177,7 @@ type model struct {
 	windowsPasteCaptureEnabled bool
 	terminalPasteSeq           uint64
 	terminalPaste              *terminalPasteCapture
+	deferredInput              []tea.KeyMsg
 
 	followOutput     bool
 	markdownRenderer *glamour.TermRenderer
@@ -278,6 +281,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	previousYOffset := m.viewport.YOffset
 	manualScrollUp := false
 	manualScrollDown := false
+	routeToInput := true
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -288,26 +292,41 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshViewport()
 
 	case tea.KeyMsg:
-		if m.terminalPaste != nil {
-			m.terminalPaste.buffered = append(m.terminalPaste.buffered, cloneKeyMsg(msg))
-			content, replay, resolved := m.evaluateTerminalPaste()
-			if !resolved {
-				return m, nil
+		scrollUpKey := key.Matches(msg, m.viewport.KeyMap.Up, m.viewport.KeyMap.PageUp, m.viewport.KeyMap.HalfPageUp)
+		scrollDownKey := key.Matches(msg, m.viewport.KeyMap.Down, m.viewport.KeyMap.PageDown, m.viewport.KeyMap.HalfPageDown)
+		if scrollUpKey || scrollDownKey {
+			routeToInput = false
+			m.deferTerminalPasteCapture()
+		} else {
+			if len(m.deferredInput) > 0 {
+				return replayDeferredInputAndKey(m, msg)
 			}
-			if content != "" {
-				m.handlePastedText(content)
-				m.layout()
-				m.refreshViewport()
+			if m.terminalPaste != nil {
+				if len(m.terminalPaste.buffered) == 0 && time.Since(m.terminalPaste.startedAt) > terminalPasteFirstKeyWait {
+					m.terminalPaste = nil
+					return m.Update(msg)
+				}
+				m.terminalPaste.lastActivity = time.Now()
+				m.terminalPaste.buffered = append(m.terminalPaste.buffered, cloneKeyMsg(msg))
+				content, replay, resolved := m.evaluateTerminalPaste()
+				if !resolved {
+					return m, nil
+				}
+				if content != "" {
+					m.handlePastedText(content)
+					m.layout()
+					m.refreshViewport()
+				}
+				return replayKeyMessages(m, replay)
 			}
-			return replayKeyMessages(m, replay)
+			if m.windowsPasteCaptureEnabled && isTerminalPastePrelude(msg) {
+				return m, m.startTerminalPasteCapture()
+			}
 		}
-		if m.windowsPasteCaptureEnabled && isTerminalPastePrelude(msg) {
-			return m, m.startTerminalPasteCapture()
-		}
-		if key.Matches(msg, m.viewport.KeyMap.Up, m.viewport.KeyMap.PageUp, m.viewport.KeyMap.HalfPageUp) {
+		if scrollUpKey {
 			manualScrollUp = true
 		}
-		if key.Matches(msg, m.viewport.KeyMap.Down, m.viewport.KeyMap.PageDown, m.viewport.KeyMap.HalfPageDown) {
+		if scrollDownKey {
 			manualScrollDown = true
 		}
 		switch {
@@ -338,6 +357,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.MouseMsg:
+		routeToInput = false
+		m.deferTerminalPasteCapture()
 		if msg.Action == tea.MouseActionPress {
 			switch msg.Button {
 			case tea.MouseButtonWheelUp:
@@ -506,6 +527,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.terminalPaste.expected = normalizePastedText(msg.content)
 			m.terminalPaste.expectedSet = true
 			m.terminalPaste.timeoutToken++
+			if len(m.terminalPaste.buffered) == 0 {
+				m.terminalPaste.lastActivity = time.Now()
+			}
 			content, replay, resolved := m.evaluateTerminalPaste()
 			if resolved {
 				if content != "" {
@@ -518,7 +542,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, terminalPasteTimeoutCmd(
 				msg.probeID,
 				m.terminalPaste.timeoutToken,
-				terminalPasteCaptureWait(len([]rune(m.terminalPaste.expected))),
+				terminalPasteIdleWait,
 			)
 		}
 		if msg.err != nil {
@@ -534,6 +558,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.terminalPaste == nil || m.terminalPaste.id != msg.probeID || m.terminalPaste.timeoutToken != msg.token {
 			return m, nil
 		}
+		if m.terminalPaste.expectedSet {
+			remaining := terminalPasteIdleWait - time.Since(m.terminalPaste.lastActivity)
+			if remaining > 0 {
+				return m, terminalPasteTimeoutCmd(msg.probeID, msg.token, remaining)
+			}
+		}
 		replay := append([]tea.KeyMsg(nil), m.terminalPaste.buffered...)
 		m.terminalPaste = nil
 		return replayKeyMessages(m, replay)
@@ -543,11 +573,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	var cmd tea.Cmd
-	inputBefore := []rune(m.input.Value())
-	cursorBefore := m.input.Position()
-	m.input, cmd = m.input.Update(msg)
-	m.reconcilePasteBlocks(inputBefore, cursorBefore)
-	cmds = append(cmds, cmd)
+	if routeToInput {
+		inputBefore := []rune(m.input.Value())
+		cursorBefore := m.input.Position()
+		m.input, cmd = m.input.Update(msg)
+		m.reconcilePasteBlocks(inputBefore, cursorBefore)
+		cmds = append(cmds, cmd)
+	}
 
 	m.viewport, cmd = m.viewport.Update(msg)
 	cmds = append(cmds, cmd)
@@ -598,9 +630,12 @@ func readClipboardCmd(probeID uint64) tea.Cmd {
 
 func (m *model) startTerminalPasteCapture() tea.Cmd {
 	m.terminalPasteSeq++
+	now := time.Now()
 	m.terminalPaste = &terminalPasteCapture{
 		id:           m.terminalPasteSeq,
 		timeoutToken: 1,
+		startedAt:    now,
+		lastActivity: now,
 	}
 	return tea.Batch(
 		readClipboardCmd(m.terminalPaste.id),
@@ -614,11 +649,6 @@ func terminalPasteTimeoutCmd(probeID, token uint64, wait time.Duration) tea.Cmd 
 	})
 }
 
-func terminalPasteCaptureWait(runes int) time.Duration {
-	wait := terminalPasteBaseWait + time.Duration(runes/500)*time.Second
-	return min(wait, terminalPasteMaxWait)
-}
-
 func isTerminalPastePrelude(msg tea.KeyMsg) bool {
 	return msg.Type == tea.KeyNull ||
 		(msg.Type == tea.KeyRunes && len(msg.Runes) == 1 && msg.Runes[0] == 0 && !msg.Paste)
@@ -627,6 +657,25 @@ func isTerminalPastePrelude(msg tea.KeyMsg) bool {
 func cloneKeyMsg(msg tea.KeyMsg) tea.KeyMsg {
 	msg.Runes = append([]rune(nil), msg.Runes...)
 	return msg
+}
+
+func (m *model) deferTerminalPasteCapture() {
+	if m.terminalPaste == nil {
+		return
+	}
+	for _, msg := range m.terminalPaste.buffered {
+		m.deferredInput = append(m.deferredInput, cloneKeyMsg(msg))
+	}
+	m.terminalPaste = nil
+}
+
+func replayDeferredInputAndKey(m model, current tea.KeyMsg) (tea.Model, tea.Cmd) {
+	deferred := append([]tea.KeyMsg(nil), m.deferredInput...)
+	m.deferredInput = nil
+	updated, replayCmd := replayKeyMessages(m, deferred)
+	m = updated.(model)
+	updated, currentCmd := m.Update(current)
+	return updated, tea.Batch(replayCmd, currentCmd)
 }
 
 func terminalPasteKeyText(msg tea.KeyMsg) (string, bool) {
