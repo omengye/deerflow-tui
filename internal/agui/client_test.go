@@ -2,6 +2,7 @@ package agui
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,7 +11,7 @@ import (
 
 func TestParseSSECollectsMultilineData(t *testing.T) {
 	var events []string
-	err := parseSSE(strings.NewReader("event: message\ndata: {\"type\":\"TEXT_MESSAGE_CONTENT\",\ndata: \"delta\":\"hi\"}\n\n"), func(data string) {
+	err := parseSSE(strings.NewReader("event: message\ndata: {\"type\":\"TEXT_MESSAGE_CONTENT\",\ndata: \"delta\":\"hi\"}\n\n"), func(_ string, data string) {
 		events = append(events, data)
 	})
 	if err != nil {
@@ -26,7 +27,7 @@ func TestParseSSECollectsMultilineData(t *testing.T) {
 
 func TestParseSSEFlushesTrailingEventWithoutBlankLine(t *testing.T) {
 	var events []string
-	err := parseSSE(strings.NewReader("data: {\"type\":\"RUN_FINISHED\"}"), func(data string) {
+	err := parseSSE(strings.NewReader("data: {\"type\":\"RUN_FINISHED\"}"), func(_ string, data string) {
 		events = append(events, data)
 	})
 	if err != nil {
@@ -34,6 +35,19 @@ func TestParseSSEFlushesTrailingEventWithoutBlankLine(t *testing.T) {
 	}
 	if len(events) != 1 || events[0] != "{\"type\":\"RUN_FINISHED\"}" {
 		t.Fatalf("unexpected events: %#v", events)
+	}
+}
+
+func TestParseSSECapturesEventID(t *testing.T) {
+	var gotID string
+	err := parseSSE(strings.NewReader("id: 123-4\ndata: {\"type\":\"RUN_FINISHED\"}\n\n"), func(eventID, _ string) {
+		gotID = eventID
+	})
+	if err != nil {
+		t.Fatalf("parseSSE returned error: %v", err)
+	}
+	if gotID != "123-4" {
+		t.Fatalf("expected event id 123-4, got %q", gotID)
 	}
 }
 
@@ -111,5 +125,58 @@ func TestStreamRunIDPropagated(t *testing.T) {
 
 	if stream.RunID == "" {
 		t.Fatal("expected RunID to be set on Stream")
+	}
+}
+
+func TestConnectRunSendsContinueAndLastEventID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Last-Event-ID"); got != "10-2" {
+			t.Errorf("Last-Event-ID = %q, want 10-2", got)
+		}
+		var payload RunAgentInput
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if payload.RunID != "run-fixed" || payload.OnDisconnect != "continue" || payload.MultitaskStrategy != "interrupt" {
+			t.Fatalf("unexpected payload: %#v", payload)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("id: 10-3\ndata: {\"type\":\"RUN_FINISHED\"}\n\n"))
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL+"/chat/agui", nil, nil)
+	stream, err := client.ConnectRun(context.Background(), RunRequest{
+		RunID:       "run-fixed",
+		ThreadID:    "thread-1",
+		LastEventID: "10-2",
+	})
+	if err != nil {
+		t.Fatalf("ConnectRun failed: %v", err)
+	}
+	event := <-stream.Events
+	if event.SSEID != "10-3" {
+		t.Fatalf("event SSEID = %q, want 10-3", event.SSEID)
+	}
+}
+
+func TestGetThreadMessagesNormalizesBackendMessageTypes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/threads/thread-1") {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"thread_id":"thread-1","messages":[{"type":"human","content":"hello","id":"u1"},{"type":"ai","content":"hi","id":"a1"}],"artifacts":[],"status":"idle"}`))
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL+"/api/chat/agui", nil, nil)
+	messages, err := client.GetThreadMessages(context.Background(), "thread-1")
+	if err != nil {
+		t.Fatalf("GetThreadMessages failed: %v", err)
+	}
+	if len(messages) != 2 || messages[0].Role != RoleUser || messages[1].Role != RoleAssistant {
+		t.Fatalf("unexpected messages: %#v", messages)
 	}
 }

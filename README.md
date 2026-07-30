@@ -73,6 +73,8 @@ scripts/
 | `/new` | 新建线程 |
 | 左键点击选中消息 | ✅ |
 | `Ctrl+C` 复制消息内容到剪贴板 | ✅ |
+| 左键拖动选择文本（到视图区边缘自动滚动），右键或 `Ctrl+C` 复制 | ✅ |
+| `Ctrl+V` 粘贴多行文本时显示 `[paste N lines]`，按 `Enter` 后作为一条消息发送 | ✅ |
 | TEXT_MESSAGE 流式事件 | ✅ |
 | REASONING 事件 | ✅ |
 | THINKING 事件 | ✅ |
@@ -83,6 +85,9 @@ scripts/
 | 模型中断（Interrupt）与回复（Resume） | ✅ |
 | 历史消息 replay 文本/ID 过滤 | ✅ |
 | Stale stream 事件隔离（runSeq） | ✅ |
+| SSE 断线续传（Last-Event-ID） | ✅ |
+| 10 分钟指数退避重连 | ✅ |
+| TUI 重启后恢复活动 run | ✅ |
 | 终端宽度自适应与文本换行 | ✅ |
 | `.env` 文件自动加载 | ✅ |
 
@@ -93,6 +98,7 @@ scripts/
 | `AG_UI_ENDPOINT` | `http://localhost:8000/agent` | AG-UI 服务端地址 |
 | `AG_UI_HEADERS` | 空 | JSON 字符串，作为请求头传给 AG-UI 服务端 |
 | `AG_UI_INITIAL_STATE` | 空 | JSON 对象字符串，作为初始 state 传给 Agent |
+| `DEERFLOW_TUI_STATE_DIR` | 用户配置目录下的 `deerflow-tui` | 活动 run 会话文件目录 |
 
 支持 `.env` 文件自动加载（best-effort，文件不存在时静默忽略）。
 

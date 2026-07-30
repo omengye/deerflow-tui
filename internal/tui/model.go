@@ -5,26 +5,63 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"runtime"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/atotto/clipboard"
+	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
+	"github.com/charmbracelet/glamour/styles"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"deerflow-tui/internal/agui"
 	"deerflow-tui/internal/config"
 )
 
-const emptyThreadText = "(No messages yet. Type to start.)"
+const (
+	emptyThreadText         = "(No messages yet. Type to start.)"
+	selectionScrollInterval = 50 * time.Millisecond
+	terminalPasteProbeWait  = 1500 * time.Millisecond
+	terminalPasteBaseWait   = 2 * time.Second
+	terminalPasteMaxWait    = 45 * time.Second
+)
+
+var (
+	readClipboard  = clipboard.ReadAll
+	writeClipboard = clipboard.WriteAll
+)
+
+type displayBlockKind uint8
+
+const (
+	displayBlockPlain displayBlockKind = iota
+	displayBlockMarkdown
+	displayBlockTool
+)
+
+type toolDisplayState uint8
+
+const (
+	toolDisplayRunning toolDisplayState = iota
+	toolDisplaySucceeded
+	toolDisplayFailed
+	toolDisplayIncomplete
+)
 
 type runStartResultMsg struct {
-	runSeq uint64
-	stream *agui.Stream
-	err    error
+	runSeq           uint64
+	stream           *agui.Stream
+	recoveredHistory []agui.ChatMessage
+	err              error
 }
 
 type aguiEventMsg struct {
@@ -41,18 +78,79 @@ type streamDoneMsg struct {
 	runSeq uint64
 }
 
-type displayBlock struct {
-	header  string
+type threadRecoveredMsg struct {
+	runSeq  uint64
+	history []agui.ChatMessage
+	err     error
+}
+
+type clipboardPasteMsg struct {
+	probeID uint64
 	content string
+	err     error
+}
+
+type terminalPasteTimeoutMsg struct {
+	probeID uint64
+	token   uint64
+}
+
+type terminalPasteCapture struct {
+	id           uint64
+	timeoutToken uint64
+	expected     string
+	expectedSet  bool
+	received     string
+	processed    int
+	buffered     []tea.KeyMsg
+}
+
+type pasteBlock struct {
+	content string
+	lines   int
+	start   int
+	end     int
+}
+
+type selectionScrollTickMsg struct {
+	token uint64
+}
+
+type textPosition struct {
+	line int
+	col  int
+}
+
+type textSelection struct {
+	anchor          textPosition
+	cursor          textPosition
+	dragging        bool
+	active          bool
+	scrollDirection int
+	scrollToken     uint64
+	lastMouseX      int
+	lastMouseY      int
+}
+
+type displayBlock struct {
+	header          string
+	content         string
+	kind            displayBlockKind
+	toolName        string
+	toolState       toolDisplayState
+	renderedContent string
+	renderedWidth   int
+	rendered        bool
 }
 
 type toolCallBuffer struct {
-	id      string
-	name    string
-	args    strings.Builder
-	result  string
-	isError bool
-	ended   bool
+	id       string
+	name     string
+	args     strings.Builder
+	result   string
+	isError  bool
+	ended    bool
+	complete bool
 }
 
 type replayState struct {
@@ -71,6 +169,16 @@ type model struct {
 
 	viewport viewport.Model
 	input    textinput.Model
+	spinner  spinner.Model
+	pastes   []pasteBlock
+
+	windowsPasteCaptureEnabled bool
+	terminalPasteSeq           uint64
+	terminalPaste              *terminalPasteCapture
+
+	followOutput     bool
+	markdownRenderer *glamour.TermRenderer
+	markdownWidth    int
 
 	status   string
 	threadID string
@@ -78,7 +186,12 @@ type model struct {
 	running  bool
 	runSeq   uint64
 
-	activeRunID string
+	activeRunID        string
+	runSession         *runSession
+	sessionStore       *runSessionStore
+	reconnectAttempt   int
+	reconnectDeadline  time.Time
+	reconnectScheduled bool
 
 	blocks           []displayBlock
 	blockIndexes     map[string]int
@@ -87,6 +200,8 @@ type model struct {
 	resumeParent     string
 	selectedBlockIdx int
 	lineToBlock      []int
+	renderedLines    []string
+	selection        textSelection
 
 	stream          *agui.Stream
 	asyncCh         chan tea.Msg
@@ -111,44 +226,107 @@ func NewModel(cfg config.Config) tea.Model {
 	input.Width = 60
 
 	vp := viewport.New(80, 20)
+	vp.KeyMap = viewportNavigationKeyMap()
 	vp.SetContent(emptyThreadText)
+	toolSpinner := spinner.New(
+		spinner.WithSpinner(spinner.MiniDot),
+		spinner.WithStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("6"))),
+	)
 
-	return model{
-		cfg:              cfg,
-		client:           agui.NewClient(cfg.Endpoint, cfg.Headers, cfg.InitialState),
-		viewport:         vp,
-		input:            input,
-		status:           "Idle",
-		threadID:         mustThreadID(),
-		asyncCh:          make(chan tea.Msg, 512),
-		blockIndexes:     map[string]int{},
-		replay:           newReplayState(nil),
-		textBuffers:      map[string]*strings.Builder{},
-		textAgentNames:   map[string]string{},
-		reasoningBuffer:  map[string]*strings.Builder{},
-		toolBuffers:      map[string]*toolCallBuffer{},
-		selectedBlockIdx: -1,
+	m := model{
+		cfg:                        cfg,
+		client:                     agui.NewClient(cfg.Endpoint, cfg.Headers, cfg.InitialState),
+		sessionStore:               newRunSessionStore(cfg.StateDir),
+		viewport:                   vp,
+		input:                      input,
+		spinner:                    toolSpinner,
+		windowsPasteCaptureEnabled: runtime.GOOS == "windows",
+		followOutput:               true,
+		status:                     "Idle",
+		threadID:                   mustThreadID(),
+		asyncCh:                    make(chan tea.Msg, 512),
+		blockIndexes:               map[string]int{},
+		replay:                     newReplayState(nil),
+		textBuffers:                map[string]*strings.Builder{},
+		textAgentNames:             map[string]string{},
+		reasoningBuffer:            map[string]*strings.Builder{},
+		toolBuffers:                map[string]*toolCallBuffer{},
+		selectedBlockIdx:           -1,
 	}
+	if session, err := m.sessionStore.load(cfg.Endpoint); err == nil && session != nil {
+		m.runSession = session
+		m.threadID = session.ThreadID
+		m.activeRunID = session.RunID
+		m.starting = true
+		m.running = true
+		m.status = "Restoring agent stream..."
+		m.reconnectDeadline = time.Now().Add(reconnectWindow)
+	}
+	return m
 }
 
 func (m model) Init() tea.Cmd {
+	if m.runSession != nil {
+		return tea.Batch(textinput.Blink, m.recoverRunCmd())
+	}
 	return textinput.Blink
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
+	hadRunningTools := m.hasRunningTools()
+	previousYOffset := m.viewport.YOffset
+	manualScrollUp := false
+	manualScrollDown := false
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		m.clearTextSelection()
 		m.width = msg.Width
 		m.height = msg.Height
 		m.layout()
 		m.refreshViewport()
 
 	case tea.KeyMsg:
+		if m.terminalPaste != nil {
+			m.terminalPaste.buffered = append(m.terminalPaste.buffered, cloneKeyMsg(msg))
+			content, replay, resolved := m.evaluateTerminalPaste()
+			if !resolved {
+				return m, nil
+			}
+			if content != "" {
+				m.handlePastedText(content)
+				m.layout()
+				m.refreshViewport()
+			}
+			return replayKeyMessages(m, replay)
+		}
+		if m.windowsPasteCaptureEnabled && isTerminalPastePrelude(msg) {
+			return m, m.startTerminalPasteCapture()
+		}
+		if key.Matches(msg, m.viewport.KeyMap.Up, m.viewport.KeyMap.PageUp, m.viewport.KeyMap.HalfPageUp) {
+			manualScrollUp = true
+		}
+		if key.Matches(msg, m.viewport.KeyMap.Down, m.viewport.KeyMap.PageDown, m.viewport.KeyMap.HalfPageDown) {
+			manualScrollDown = true
+		}
 		switch {
+		case msg.Paste:
+			m.handlePastedText(string(msg.Runes))
+			m.layout()
+			m.refreshViewport()
+			return m, tea.Batch(cmds...)
+		case keyMatches(msg, "ctrl+v"):
+			return m, readClipboardCmd(0)
 		case keyMatches(msg, "ctrl+c"):
-			m.copySelectedBlock()
+			m.copyCurrentSelection()
+		case keyMatches(msg, "esc"):
+			m.clearTextSelection()
+			if len(m.pastes) > 0 {
+				m.clearPasteBlocks()
+				m.status = "Pasted text cleared"
+				m.layout()
+			}
 		case keyMatches(msg, "enter"):
 			cmd := m.handleSubmit()
 			m.layout()
@@ -160,8 +338,40 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.MouseMsg:
-		if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress {
+		if msg.Action == tea.MouseActionPress {
+			switch msg.Button {
+			case tea.MouseButtonWheelUp:
+				manualScrollUp = true
+			case tea.MouseButtonWheelDown:
+				manualScrollDown = true
+			}
+		}
+		switch {
+		case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress && !msg.Shift:
+			m.startTextSelection(msg.X, msg.Y)
 			m.handleLeftClick(msg.Y)
+		case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionMotion && m.selection.dragging:
+			if selectionCmd := m.dragTextSelection(msg.X, msg.Y); selectionCmd != nil {
+				cmds = append(cmds, selectionCmd)
+			}
+		case msg.Action == tea.MouseActionRelease && m.selection.dragging:
+			m.finishTextSelection(msg.X, msg.Y)
+		case msg.Button == tea.MouseButtonRight && msg.Action == tea.MouseActionPress && !msg.Shift:
+			m.copySelectionAt(msg.Y)
+		}
+
+	case selectionScrollTickMsg:
+		if selectionCmd := m.handleSelectionScrollTick(msg); selectionCmd != nil {
+			cmds = append(cmds, selectionCmd)
+		}
+
+	case spinner.TickMsg:
+		if m.hasRunningTools() {
+			var spinnerCmd tea.Cmd
+			m.spinner, spinnerCmd = m.spinner.Update(msg)
+			if spinnerCmd != nil {
+				cmds = append(cmds, spinnerCmd)
+			}
 		}
 
 	case runStartResultMsg:
@@ -172,16 +382,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 
+		m.reconnectScheduled = false
+		if len(msg.recoveredHistory) > 0 {
+			m.handleEvent(agui.EventEnvelope{
+				Type: "MESSAGES_SNAPSHOT",
+				Raw:  map[string]any{"type": "MESSAGES_SNAPSHOT", "messages": chatMessagesToAny(msg.recoveredHistory)},
+			})
+		}
+
 		if msg.err != nil {
+			if cmd, handled := m.handleReconnectableError(msg.err); handled {
+				if cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+				break
+			}
 			m.starting = false
 			m.running = false
 			m.status = fmt.Sprintf("Run error: %v", msg.err)
 			m.appendSystemBlock("RUN_ERROR", "", msg.err.Error())
+			m.clearRunSession()
 			break
 		}
 
 		m.stream = msg.stream
 		m.activeRunID = msg.stream.RunID
+		m.reconnectScheduled = false
+		if m.reconnectDeadline.IsZero() {
+			m.reconnectAttempt = 0
+		}
 		m.starting = false
 		m.running = true
 		m.status = "Running"
@@ -195,6 +424,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			break
 		}
+		m.reconnectScheduled = false
+		m.reconnectAttempt = 0
+		m.reconnectDeadline = time.Time{}
+		if msg.event.SSEID != "" && m.runSession != nil {
+			m.runSession.LastEventID = msg.event.SSEID
+			m.runSession.UpdatedAt = time.Now()
+			_ = m.sessionStore.save(m.runSession)
+		}
 		m.handleEvent(msg.event)
 		cmds = append(cmds, waitForAsync(m.asyncCh))
 
@@ -205,10 +442,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			break
 		}
-		m.starting = false
-		m.running = false
-		m.status = fmt.Sprintf("Stream error: %v", msg.err)
-		m.appendSystemBlock("RUN_ERROR", "", msg.err.Error())
+		if cmd, handled := m.handleReconnectableError(msg.err); handled {
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		} else {
+			m.starting = false
+			m.running = false
+			m.status = fmt.Sprintf("Stream error: %v", msg.err)
+			m.appendSystemBlock("RUN_ERROR", "", msg.err.Error())
+			m.clearRunSession()
+		}
 		cmds = append(cmds, waitForAsync(m.asyncCh))
 
 	case streamDoneMsg:
@@ -218,23 +462,104 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			break
 		}
-		m.starting = false
-		m.running = false
 		m.stream = nil
+		if m.running && m.runSession != nil {
+			if !m.reconnectScheduled {
+				if cmd, handled := m.handleReconnectableError(errors.New("stream ended before terminal event")); handled && cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+			}
+			break
+		}
+		m.starting = false
 		if strings.HasPrefix(m.status, "Running") || m.status == "Running" {
 			m.status = "Idle"
 		}
+
+	case threadRecoveredMsg:
+		if msg.runSeq != m.runSeq {
+			break
+		}
+		if msg.err != nil {
+			m.status = fmt.Sprintf("Replay expired; thread refresh failed: %v", msg.err)
+			break
+		}
+		if len(msg.history) > 0 {
+			m.handleEvent(agui.EventEnvelope{
+				Type: "MESSAGES_SNAPSHOT",
+				Raw:  map[string]any{"type": "MESSAGES_SNAPSHOT", "messages": chatMessagesToAny(msg.history)},
+			})
+		}
+		m.status = "Idle"
+
+	case clipboardPasteMsg:
+		if msg.probeID != 0 {
+			if m.terminalPaste == nil || m.terminalPaste.id != msg.probeID {
+				return m, nil
+			}
+			if msg.err != nil || msg.content == "" {
+				replay := append([]tea.KeyMsg(nil), m.terminalPaste.buffered...)
+				m.terminalPaste = nil
+				return replayKeyMessages(m, replay)
+			}
+
+			m.terminalPaste.expected = normalizePastedText(msg.content)
+			m.terminalPaste.expectedSet = true
+			m.terminalPaste.timeoutToken++
+			content, replay, resolved := m.evaluateTerminalPaste()
+			if resolved {
+				if content != "" {
+					m.handlePastedText(content)
+					m.layout()
+					m.refreshViewport()
+				}
+				return replayKeyMessages(m, replay)
+			}
+			return m, terminalPasteTimeoutCmd(
+				msg.probeID,
+				m.terminalPaste.timeoutToken,
+				terminalPasteCaptureWait(len([]rune(m.terminalPaste.expected))),
+			)
+		}
+		if msg.err != nil {
+			m.status = fmt.Sprintf("Paste failed: %v", msg.err)
+			return m, nil
+		}
+		m.handlePastedText(msg.content)
+		m.layout()
+		m.refreshViewport()
+		return m, nil
+
+	case terminalPasteTimeoutMsg:
+		if m.terminalPaste == nil || m.terminalPaste.id != msg.probeID || m.terminalPaste.timeoutToken != msg.token {
+			return m, nil
+		}
+		replay := append([]tea.KeyMsg(nil), m.terminalPaste.buffered...)
+		m.terminalPaste = nil
+		return replayKeyMessages(m, replay)
 
 	case nil:
 		// no-op
 	}
 
 	var cmd tea.Cmd
+	inputBefore := []rune(m.input.Value())
+	cursorBefore := m.input.Position()
 	m.input, cmd = m.input.Update(msg)
+	m.reconcilePasteBlocks(inputBefore, cursorBefore)
 	cmds = append(cmds, cmd)
 
 	m.viewport, cmd = m.viewport.Update(msg)
 	cmds = append(cmds, cmd)
+	if manualScrollUp && m.viewport.YOffset < previousYOffset {
+		m.followOutput = false
+	}
+	if manualScrollDown && m.viewport.AtBottom() {
+		m.followOutput = true
+	}
+	if !hadRunningTools && m.hasRunningTools() {
+		cmds = append(cmds, m.spinner.Tick)
+	}
 
 	m.refreshViewport()
 
@@ -249,9 +574,8 @@ func (m model) View() string {
 	header := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6")).Render("deerflow-tui") +
 		lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(" - AG-UI Bubble Tea rewrite")
 
-	inputLine := lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("8")).Padding(0, 1).Render(
-		m.input.View(),
-	)
+	inputBody := m.input.View()
+	inputLine := lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("8")).Padding(0, 1).Render(inputBody)
 
 	status := lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(
 		fmt.Sprintf("%s | Messages: %d | Thread: %s | %s", m.status, len(m.history), shortID(m.threadID), m.cfg.Endpoint),
@@ -265,25 +589,369 @@ func (m model) View() string {
 	return lipgloss.NewStyle().MaxWidth(m.width).MaxHeight(m.height).Render(frame)
 }
 
+func readClipboardCmd(probeID uint64) tea.Cmd {
+	return func() tea.Msg {
+		content, err := readClipboard()
+		return clipboardPasteMsg{probeID: probeID, content: content, err: err}
+	}
+}
+
+func (m *model) startTerminalPasteCapture() tea.Cmd {
+	m.terminalPasteSeq++
+	m.terminalPaste = &terminalPasteCapture{
+		id:           m.terminalPasteSeq,
+		timeoutToken: 1,
+	}
+	return tea.Batch(
+		readClipboardCmd(m.terminalPaste.id),
+		terminalPasteTimeoutCmd(m.terminalPaste.id, m.terminalPaste.timeoutToken, terminalPasteProbeWait),
+	)
+}
+
+func terminalPasteTimeoutCmd(probeID, token uint64, wait time.Duration) tea.Cmd {
+	return tea.Tick(wait, func(time.Time) tea.Msg {
+		return terminalPasteTimeoutMsg{probeID: probeID, token: token}
+	})
+}
+
+func terminalPasteCaptureWait(runes int) time.Duration {
+	wait := terminalPasteBaseWait + time.Duration(runes/500)*time.Second
+	return min(wait, terminalPasteMaxWait)
+}
+
+func isTerminalPastePrelude(msg tea.KeyMsg) bool {
+	return msg.Type == tea.KeyNull ||
+		(msg.Type == tea.KeyRunes && len(msg.Runes) == 1 && msg.Runes[0] == 0 && !msg.Paste)
+}
+
+func cloneKeyMsg(msg tea.KeyMsg) tea.KeyMsg {
+	msg.Runes = append([]rune(nil), msg.Runes...)
+	return msg
+}
+
+func terminalPasteKeyText(msg tea.KeyMsg) (string, bool) {
+	if msg.Paste || msg.Alt {
+		return "", false
+	}
+	switch msg.Type {
+	case tea.KeyRunes:
+		return normalizePastedText(string(msg.Runes)), true
+	case tea.KeyEnter, tea.KeyCtrlJ:
+		return "\n", true
+	case tea.KeyTab:
+		return "\t", true
+	case tea.KeySpace:
+		return " ", true
+	default:
+		return "", false
+	}
+}
+
+func (m *model) evaluateTerminalPaste() (content string, replay []tea.KeyMsg, resolved bool) {
+	capture := m.terminalPaste
+	if capture == nil || !capture.expectedSet {
+		return "", nil, false
+	}
+
+	for capture.processed < len(capture.buffered) {
+		fragment, ok := terminalPasteKeyText(capture.buffered[capture.processed])
+		capture.processed++
+		if !ok {
+			replay = append([]tea.KeyMsg(nil), capture.buffered...)
+			m.terminalPaste = nil
+			return "", replay, true
+		}
+		capture.received += fragment
+		if !strings.HasPrefix(capture.expected, capture.received) {
+			replay = append([]tea.KeyMsg(nil), capture.buffered...)
+			m.terminalPaste = nil
+			return "", replay, true
+		}
+		if capture.received == capture.expected {
+			content = capture.expected
+			replay = append([]tea.KeyMsg(nil), capture.buffered[capture.processed:]...)
+			m.terminalPaste = nil
+			return content, replay, true
+		}
+	}
+	return "", nil, false
+}
+
+func replayKeyMessages(m model, messages []tea.KeyMsg) (tea.Model, tea.Cmd) {
+	cmds := make([]tea.Cmd, 0, len(messages))
+	for _, msg := range messages {
+		updated, cmd := m.Update(msg)
+		m = updated.(model)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+	return m, tea.Batch(cmds...)
+}
+
+func normalizePastedText(content string) string {
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	return strings.ReplaceAll(content, "\r", "\n")
+}
+
+func (m *model) handlePastedText(content string) {
+	content = normalizePastedText(content)
+	if content == "" {
+		m.status = "Clipboard is empty"
+		return
+	}
+	if m.input.CharLimit > 0 && m.draftRuneCount()+len([]rune(content)) > m.input.CharLimit {
+		m.status = fmt.Sprintf("Paste too large (maximum draft length: %d characters)", m.input.CharLimit)
+		return
+	}
+	if !strings.Contains(content, "\n") {
+		m.insertInputText(content)
+		m.status = "Pasted from clipboard"
+		return
+	}
+	lines := pastedLineCount(content)
+	label := pasteBlockLabel(lines)
+	start := m.snapPasteCursor(m.input.Position(), 1)
+	m.input.SetCursor(start)
+	m.insertInputText(label)
+	m.pastes = append(m.pastes, pasteBlock{
+		content: content,
+		lines:   lines,
+		start:   start,
+		end:     start + len([]rune(label)),
+	})
+	m.sortPasteBlocks()
+	m.status = "Multiline paste attached; press Enter to send"
+}
+
+func (m *model) insertInputText(text string) {
+	value := []rune(m.input.Value())
+	position := m.snapPasteCursor(min(m.input.Position(), len(value)), 1)
+	inserted := []rune(text)
+	combined := make([]rune, 0, len(value)+len(inserted))
+	combined = append(combined, value[:position]...)
+	combined = append(combined, inserted...)
+	combined = append(combined, value[position:]...)
+	for i := range m.pastes {
+		if m.pastes[i].start >= position {
+			m.pastes[i].start += len(inserted)
+			m.pastes[i].end += len(inserted)
+		}
+	}
+	m.input.SetValue(string(combined))
+	m.input.SetCursor(position + len(inserted))
+}
+
+func (m *model) draftRuneCount() int {
+	total := len([]rune(m.input.Value()))
+	for _, paste := range m.pastes {
+		total += len([]rune(paste.content)) - (paste.end - paste.start)
+	}
+	return total
+}
+
+func pastedLineCount(content string) int {
+	content = strings.TrimSuffix(content, "\n")
+	return strings.Count(content, "\n") + 1
+}
+
+func pasteBlockLabel(lines int) string {
+	return fmt.Sprintf("[paste %d lines]", lines)
+}
+
+func (m *model) pasteSummary() string {
+	if len(m.pastes) == 0 {
+		return ""
+	}
+	totalLines := 0
+	for _, paste := range m.pastes {
+		totalLines += paste.lines
+	}
+	if len(m.pastes) == 1 {
+		return fmt.Sprintf("[paste %d lines]", totalLines)
+	}
+	return fmt.Sprintf("[%d pastes · %d lines]", len(m.pastes), totalLines)
+}
+
+func (m *model) sortPasteBlocks() {
+	sort.SliceStable(m.pastes, func(i, j int) bool {
+		return m.pastes[i].start < m.pastes[j].start
+	})
+}
+
+func (m *model) snapPasteCursor(position, direction int) int {
+	for _, paste := range m.pastes {
+		if position > paste.start && position < paste.end {
+			if direction < 0 {
+				return paste.start
+			}
+			return paste.end
+		}
+	}
+	return position
+}
+
+func (m *model) clearPasteBlocks() {
+	if len(m.pastes) == 0 {
+		return
+	}
+	m.sortPasteBlocks()
+	value := []rune(m.input.Value())
+	cursor := m.input.Position()
+	for i := len(m.pastes) - 1; i >= 0; i-- {
+		paste := m.pastes[i]
+		if paste.start < 0 || paste.end > len(value) || paste.start > paste.end {
+			continue
+		}
+		value = append(value[:paste.start], value[paste.end:]...)
+		size := paste.end - paste.start
+		switch {
+		case cursor >= paste.end:
+			cursor -= size
+		case cursor > paste.start:
+			cursor = paste.start
+		}
+	}
+	m.pastes = nil
+	m.input.SetValue(string(value))
+	m.input.SetCursor(cursor)
+}
+
+func (m *model) reconcilePasteBlocks(before []rune, cursorBefore int) {
+	if len(m.pastes) == 0 {
+		return
+	}
+	after := []rune(m.input.Value())
+	start, beforeEnd, afterEnd, changed := inputEdit(before, after)
+	if !changed {
+		direction := m.input.Position() - cursorBefore
+		m.input.SetCursor(m.snapPasteCursor(m.input.Position(), direction))
+		return
+	}
+
+	inserted := append([]rune(nil), after[start:afterEnd]...)
+	if start == beforeEnd {
+		for _, paste := range m.pastes {
+			if start > paste.start && start < paste.end {
+				m.input.SetValue(string(before))
+				m.input.SetCursor(paste.end)
+				m.insertInputText(string(inserted))
+				return
+			}
+		}
+	}
+
+	affected := make(map[int]struct{})
+	expandedStart := start
+	expandedEnd := beforeEnd
+	for i, paste := range m.pastes {
+		if start < paste.end && beforeEnd > paste.start {
+			affected[i] = struct{}{}
+			expandedStart = min(expandedStart, paste.start)
+			expandedEnd = max(expandedEnd, paste.end)
+		}
+	}
+
+	if len(affected) > 0 {
+		rebuilt := make([]rune, 0, len(before)-(expandedEnd-expandedStart)+len(inserted))
+		rebuilt = append(rebuilt, before[:expandedStart]...)
+		rebuilt = append(rebuilt, inserted...)
+		rebuilt = append(rebuilt, before[expandedEnd:]...)
+		delta := len(inserted) - (expandedEnd - expandedStart)
+		kept := m.pastes[:0]
+		for i, paste := range m.pastes {
+			if _, remove := affected[i]; remove {
+				continue
+			}
+			if paste.start >= expandedEnd {
+				paste.start += delta
+				paste.end += delta
+			}
+			kept = append(kept, paste)
+		}
+		m.pastes = kept
+		m.input.SetValue(string(rebuilt))
+		m.input.SetCursor(expandedStart + len(inserted))
+		return
+	}
+
+	delta := (afterEnd - start) - (beforeEnd - start)
+	for i := range m.pastes {
+		if beforeEnd <= m.pastes[i].start {
+			m.pastes[i].start += delta
+			m.pastes[i].end += delta
+		}
+	}
+	direction := m.input.Position() - cursorBefore
+	m.input.SetCursor(m.snapPasteCursor(m.input.Position(), direction))
+}
+
+func inputEdit(before, after []rune) (start, beforeEnd, afterEnd int, changed bool) {
+	for start < len(before) && start < len(after) && before[start] == after[start] {
+		start++
+	}
+	if start == len(before) && start == len(after) {
+		return start, start, start, false
+	}
+	beforeEnd = len(before)
+	afterEnd = len(after)
+	for beforeEnd > start && afterEnd > start && before[beforeEnd-1] == after[afterEnd-1] {
+		beforeEnd--
+		afterEnd--
+	}
+	return start, beforeEnd, afterEnd, true
+}
+
+func (m *model) composedInput() string {
+	value := []rune(m.input.Value())
+	if len(m.pastes) == 0 {
+		return strings.TrimSpace(string(value))
+	}
+	m.sortPasteBlocks()
+	var composed strings.Builder
+	last := 0
+	for _, paste := range m.pastes {
+		if paste.start < last || paste.start < 0 || paste.end > len(value) || paste.start > paste.end {
+			continue
+		}
+		composed.WriteString(string(value[last:paste.start]))
+		composed.WriteString(paste.content)
+		last = paste.end
+	}
+	composed.WriteString(string(value[last:]))
+	return strings.TrimSpace(composed.String())
+}
+
 func (m *model) handleSubmit() tea.Cmd {
-	text := strings.TrimSpace(m.input.Value())
-	if text == "" {
+	hasPastes := len(m.pastes) > 0
+	text := m.composedInput()
+	if strings.TrimSpace(text) == "" {
 		return nil
 	}
 	m.input.SetValue("")
+	m.pastes = nil
+	m.layout()
+	m.followOutput = true
 
-	switch strings.ToLower(text) {
+	command := ""
+	if !hasPastes {
+		command = strings.ToLower(text)
+	}
+	switch command {
 	case "/exit", "/quit":
 		m.stopStream()
 		return tea.Quit
 	case "/cancel":
 		m.cancelServerRun()
 		m.stopStream()
+		m.clearRunSession()
 		m.clearInterrupts()
 		m.status = "Idle (cancelled)"
 		return nil
 	case "/new":
+		m.cancelServerRun()
 		m.stopStream()
+		m.clearRunSession()
 		m.threadID = mustThreadID()
 		m.history = nil
 		m.clearInterrupts()
@@ -292,6 +960,7 @@ func (m *model) handleSubmit() tea.Cmd {
 		m.replay = newReplayState(nil)
 		m.selectedBlockIdx = -1
 		m.lineToBlock = nil
+		m.clearTextSelection()
 		m.textPartCounter = 0
 		m.reasonCounter = 0
 		m.toolCounter = 0
@@ -305,7 +974,9 @@ func (m *model) handleSubmit() tea.Cmd {
 	}
 
 	if m.running || m.starting {
+		m.cancelServerRun()
 		m.stopStream()
+		m.clearRunSession()
 		m.status = "Restarting run..."
 	}
 
@@ -314,11 +985,17 @@ func (m *model) handleSubmit() tea.Cmd {
 
 	history := append([]agui.ChatMessage(nil), m.history...)
 	threadID := m.threadID
+	runID, err := agui.NewRunID()
+	if err != nil {
+		m.status = fmt.Sprintf("Run error: %v", err)
+		return nil
+	}
 	runSeq := m.beginRun(history)
+	m.setRunSession(&runSession{Endpoint: m.cfg.Endpoint, ThreadID: threadID, RunID: runID, UpdatedAt: time.Now()})
 	m.status = "Starting run..."
 
 	return func() tea.Msg {
-		stream, err := m.client.StartRun(context.Background(), threadID, history)
+		stream, err := m.client.ConnectRun(context.Background(), agui.RunRequest{RunID: runID, ThreadID: threadID, History: history})
 		return runStartResultMsg{runSeq: runSeq, stream: stream, err: err}
 	}
 }
@@ -333,12 +1010,18 @@ func (m *model) handleInterruptResponse(text string) tea.Cmd {
 
 	history := append([]agui.ChatMessage(nil), m.history...)
 	threadID := m.threadID
+	runID, err := agui.NewRunID()
+	if err != nil {
+		m.status = fmt.Sprintf("Resume error: %v", err)
+		return nil
+	}
 	runSeq := m.beginRun(history)
+	m.setRunSession(&runSession{Endpoint: m.cfg.Endpoint, ThreadID: threadID, RunID: runID, UpdatedAt: time.Now()})
 	m.status = "Resuming run..."
 	m.clearInterrupts()
 
 	return func() tea.Msg {
-		stream, err := m.client.ResumeRun(context.Background(), threadID, history, responses)
+		stream, err := m.client.ConnectRun(context.Background(), agui.RunRequest{RunID: runID, ThreadID: threadID, History: history, Resume: responses})
 		return runStartResultMsg{runSeq: runSeq, stream: stream, err: err}
 	}
 }
@@ -357,6 +1040,7 @@ func (m *model) handleEvent(event agui.EventEnvelope) {
 
 	case "RUN_FINISHED":
 		m.finalizeRun()
+		m.clearRunSession()
 		if interrupts := agui.InterruptsFromRunFinished(event); len(interrupts) > 0 {
 			m.running = false
 			m.status = "Requires interrupt response"
@@ -366,15 +1050,17 @@ func (m *model) handleEvent(event agui.EventEnvelope) {
 		}
 		m.running = false
 		m.status = "Idle"
-		m.appendSystemBlock("RUN_FINISHED", valueString(event.Raw, "runId"), compactJSON(event.Raw))
+		m.appendSystemBlock("RUN_FINISHED", valueString(event.Raw, "runId"), "")
 
 	case "RUN_CANCELLED":
+		m.clearRunSession()
 		m.running = false
 		m.status = "Cancelled"
 		m.finalizeRun()
 		m.appendSystemBlock("RUN_CANCELLED", valueString(event.Raw, "runId"), "")
 
 	case "RUN_ERROR":
+		m.clearRunSession()
 		m.running = false
 		m.status = "Run error"
 		m.finalizeRun()
@@ -387,7 +1073,6 @@ func (m *model) handleEvent(event agui.EventEnvelope) {
 		}
 		m.recordTextAgentName(id, event)
 		m.ensureTextBuffer(id)
-		m.upsertBlock(textBlockKey(id), m.textMessageHeader(id), "")
 
 	case "TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_CHUNK":
 		id := m.resolveTextID(event.MessageID, false)
@@ -397,13 +1082,13 @@ func (m *model) handleEvent(event agui.EventEnvelope) {
 		m.recordTextAgentName(id, event)
 		if event.Delta == "" {
 			if buf, ok := m.textBuffers[id]; ok {
-				m.upsertBlock(textBlockKey(id), m.textMessageHeader(id), buf.String())
+				m.renderStreamingText(id, buf.String())
 			}
 			return
 		}
 		buf := m.ensureTextBuffer(id)
 		buf.WriteString(event.Delta)
-		m.upsertBlock(textBlockKey(id), m.textMessageHeader(id), buf.String())
+		m.renderStreamingText(id, buf.String())
 
 	case "TEXT_MESSAGE_END":
 		id := m.resolveTextID(event.MessageID, false)
@@ -421,7 +1106,7 @@ func (m *model) handleEvent(event agui.EventEnvelope) {
 			m.clearActiveText(id)
 			return
 		}
-		m.upsertBlock(textBlockKey(id), m.textMessageHeader(id), filtered)
+		m.upsertMarkdownBlock(textBlockKey(id), m.textMessageHeader(id), filtered)
 		m.history = append(m.history, agui.ChatMessage{Role: agui.RoleAssistant, Content: filtered, ID: id, Name: m.textAgentNames[id]})
 		m.replay.completedTextMessageID[id] = struct{}{}
 		delete(m.textBuffers, id)
@@ -470,46 +1155,61 @@ func (m *model) handleEvent(event agui.EventEnvelope) {
 		m.clearActiveReasoning(id)
 
 	case "TOOL_CALL_START":
-		toolID := m.resolveToolID(valueString(event.Raw, "toolCallId"))
-		name := valueString(event.Raw, "toolCallName")
+		toolID := m.resolveToolID(eventToolCallID(event))
+		name := eventToolCallName(event)
 		m.toolBuffers[toolID] = &toolCallBuffer{id: toolID, name: name}
-		m.upsertBlock(toolBlockKey(toolID), eventHeader("TOOL_CALL", toolID), strings.TrimSpace(name))
+		m.upsertToolBlock(toolID, name, toolDisplayRunning)
 		m.recordToolCallStart(toolID, name)
 
 	case "TOOL_CALL_ARGS", "TOOL_CALL_CHUNK":
-		toolID := m.resolveToolID(valueString(event.Raw, "toolCallId"))
+		toolID := m.resolveToolID(eventToolCallID(event))
 		buf, ok := m.toolBuffers[toolID]
 		if !ok {
-			buf = &toolCallBuffer{id: toolID, name: valueString(event.Raw, "toolCallName")}
+			buf = &toolCallBuffer{id: toolID, name: eventToolCallName(event)}
 			m.toolBuffers[toolID] = buf
 		}
+		if buf.name == "" {
+			buf.name = eventToolCallName(event)
+		}
 		buf.args.WriteString(event.Delta)
-		m.upsertBlock(toolBlockKey(toolID), eventHeader("TOOL_CALL", toolID), formatToolCall(buf))
+		m.upsertToolBlock(toolID, buf.name, toolDisplayRunning)
 		m.updateToolCallArgs(toolID, buf.name, buf.args.String())
 
 	case "TOOL_CALL_END":
-		toolID := m.resolveToolID(valueString(event.Raw, "toolCallId"))
-		if buf, ok := m.toolBuffers[toolID]; ok {
-			buf.ended = true
-			m.upsertBlock(toolBlockKey(toolID), eventHeader("TOOL_CALL", toolID), formatToolCall(buf))
-		} else {
-			m.upsertBlock(toolBlockKey(toolID), eventHeader("TOOL_CALL", toolID), "")
+		toolID := m.resolveToolID(eventToolCallID(event))
+		buf, ok := m.toolBuffers[toolID]
+		if !ok {
+			buf = &toolCallBuffer{id: toolID, name: eventToolCallName(event)}
+			m.toolBuffers[toolID] = buf
 		}
+		buf.ended = true
+		m.upsertToolBlock(toolID, buf.name, toolDisplayRunning)
 
 	case "TOOL_CALL_RESULT":
-		toolID := m.resolveToolID(valueString(event.Raw, "toolCallId"))
+		toolID := m.resolveToolID(eventToolCallID(event))
 		content := valueString(event.Raw, "content")
+		if content == "" {
+			content = event.Content
+		}
 		if content == "" {
 			content = compactJSON(event.Raw)
 		}
 		buf, ok := m.toolBuffers[toolID]
 		if !ok {
-			buf = &toolCallBuffer{id: toolID, name: "tool"}
+			buf = &toolCallBuffer{id: toolID, name: eventToolCallName(event)}
 			m.toolBuffers[toolID] = buf
+		}
+		if buf.name == "" {
+			buf.name = eventToolCallName(event)
 		}
 		buf.result = content
 		buf.isError = valueBool(event.Raw, "isError") || valueString(event.Raw, "role") != "tool" && valueString(event.Raw, "role") != ""
-		m.upsertBlock(toolBlockKey(toolID), eventHeader("TOOL_CALL", toolID), formatToolCall(buf))
+		buf.complete = true
+		state := toolDisplaySucceeded
+		if buf.isError {
+			state = toolDisplayFailed
+		}
+		m.upsertToolBlock(toolID, buf.name, state)
 		m.recordToolResult(toolID, content, buf.isError)
 
 	case "STATE_SNAPSHOT", "STATE_DELTA":
@@ -609,9 +1309,20 @@ func (m *model) importMessagesSnapshot(raw any) {
 	if len(messages) == 0 {
 		return
 	}
+	m.clearTextSelection()
+	m.replay.addHistoricalMessages(messages)
+	for id := range m.textBuffers {
+		if _, ok := m.replay.historicalIDs[normalizeHistoricalTextMessageID(id)]; !ok {
+			continue
+		}
+		m.replay.ignoredTextMessageIDs[id] = struct{}{}
+		delete(m.textBuffers, id)
+		delete(m.textAgentNames, id)
+	}
 	m.history = messages
 	m.blocks = nil
 	m.blockIndexes = map[string]int{}
+	m.toolBuffers = map[string]*toolCallBuffer{}
 	for _, message := range messages {
 		m.renderHistoryMessage(message)
 	}
@@ -624,15 +1335,32 @@ func (m *model) renderHistoryMessage(message agui.ChatMessage) {
 	case agui.RoleAssistant:
 		text := messageText(message.Content)
 		if text != "" {
-			m.appendChatBlock(speakerWithName("Assistant", message.Name), message.ID, text)
+			m.appendAssistantBlock(speakerWithName("Assistant", message.Name), message.ID, text)
 		}
 		for _, call := range message.ToolCalls {
 			buf := &toolCallBuffer{id: call.ID, name: call.Function.Name}
 			buf.args.WriteString(call.Function.Arguments)
-			m.upsertBlock(toolBlockKey(call.ID), eventHeader("TOOL_CALL", call.ID), formatToolCall(buf))
+			m.toolBuffers[call.ID] = buf
+			m.upsertToolBlock(call.ID, call.Function.Name, toolDisplayRunning)
 		}
 	case agui.RoleTool:
-		m.appendSystemBlock("TOOL", message.ToolCallID, messageText(message.Content))
+		toolID := strings.TrimSpace(message.ToolCallID)
+		if toolID == "" {
+			toolID = m.resolveToolID("")
+		}
+		buf, ok := m.toolBuffers[toolID]
+		if !ok {
+			buf = &toolCallBuffer{id: toolID, name: "tool"}
+			m.toolBuffers[toolID] = buf
+		}
+		buf.result = messageText(message.Content)
+		buf.isError = strings.TrimSpace(message.Error) != ""
+		buf.complete = true
+		state := toolDisplaySucceeded
+		if buf.isError {
+			state = toolDisplayFailed
+		}
+		m.upsertToolBlock(toolID, buf.name, state)
 	case agui.RoleSystem:
 		// system messages are not displayed
 	}
@@ -714,11 +1442,11 @@ func (m *model) updateToolCallArgs(toolID, name, args string) {
 }
 
 func (m *model) appendChatBlock(speaker, id, text string) {
-	header := speaker + ":"
-	if id != "" {
-		header = eventHeader(speaker, id)
-	}
-	m.appendBlock(displayBlock{header: header, content: strings.TrimSpace(text)})
+	m.appendBlock(displayBlock{header: eventHeader(speaker, id), content: strings.TrimSpace(text)})
+}
+
+func (m *model) appendAssistantBlock(speaker, id, text string) {
+	m.appendBlock(displayBlock{header: eventHeader(speaker, id), content: strings.TrimSpace(text), kind: displayBlockMarkdown})
 }
 
 func (m *model) appendSystemBlock(eventType, id, detail string) {
@@ -736,7 +1464,16 @@ func (m *model) recordTextAgentName(id string, event agui.EventEnvelope) {
 }
 
 func (m *model) textMessageHeader(id string) string {
-	return headerWithAgent(eventHeader("TEXT_MESSAGE", id), m.textAgentNames[id])
+	return eventHeader(speakerWithName("Assistant", m.textAgentNames[id]), id)
+}
+
+func (m *model) renderStreamingText(id, text string) {
+	filtered := m.replay.filterReplayText(text)
+	if filtered == "" {
+		m.removeBlock(textBlockKey(id))
+		return
+	}
+	m.upsertMarkdownBlock(textBlockKey(id), m.textMessageHeader(id), filtered)
 }
 
 func (m *model) appendBlock(block displayBlock) {
@@ -744,12 +1481,32 @@ func (m *model) appendBlock(block displayBlock) {
 }
 
 func (m *model) upsertBlock(key, header, content string) {
+	m.upsertDisplayBlock(key, displayBlock{header: header, content: strings.TrimSpace(content)})
+}
+
+func (m *model) upsertMarkdownBlock(key, header, content string) {
+	m.upsertDisplayBlock(key, displayBlock{header: header, content: strings.TrimSpace(content), kind: displayBlockMarkdown})
+}
+
+func (m *model) upsertToolBlock(toolID, name string, state toolDisplayState) {
+	key := toolBlockKey(toolID)
+	name = cleanDisplayName(name)
+	if idx, ok := m.blockIndexes[key]; ok && idx >= 0 && idx < len(m.blocks) && name == "" {
+		name = m.blocks[idx].toolName
+	}
+	if name == "" {
+		name = "tool"
+	}
+	m.upsertDisplayBlock(key, displayBlock{kind: displayBlockTool, toolName: name, toolState: state})
+}
+
+func (m *model) upsertDisplayBlock(key string, block displayBlock) {
 	if idx, ok := m.blockIndexes[key]; ok && idx >= 0 && idx < len(m.blocks) {
-		m.blocks[idx] = displayBlock{header: header, content: strings.TrimSpace(content)}
+		m.blocks[idx] = block
 		return
 	}
 	m.blockIndexes[key] = len(m.blocks)
-	m.blocks = append(m.blocks, displayBlock{header: header, content: strings.TrimSpace(content)})
+	m.blocks = append(m.blocks, block)
 }
 
 func (m *model) removeBlock(key string) {
@@ -768,6 +1525,7 @@ func (m *model) removeBlock(key string) {
 
 func (m *model) renderBlocks() string {
 	m.lineToBlock = nil
+	m.renderedLines = nil
 	if len(m.blocks) == 0 {
 		// Fill the entire viewport height with space-padded lines to prevent
 		// lipgloss's Height() from appending bare '\n' lines (which leave old
@@ -779,8 +1537,11 @@ func (m *model) renderBlocks() string {
 			for range m.viewport.Height - 1 {
 				b.WriteString(blankLine)
 			}
-			return b.String()
+			rendered := b.String()
+			m.renderedLines = strings.Split(rendered, "\n")
+			return rendered
 		}
+		m.renderedLines = []string{emptyThreadText}
 		return emptyThreadText
 	}
 
@@ -791,14 +1552,30 @@ func (m *model) renderBlocks() string {
 			prefix = "▸ "
 		}
 		m.lineToBlock = append(m.lineToBlock, i)
-		out = append(out, prefix+block.header)
+		header := block.header
+		if block.kind == displayBlockTool {
+			header = m.renderToolStatus(block)
+		}
+		out = append(out, prefix+header)
 		content := strings.TrimSpace(block.content)
 		if content != "" {
 			wrapWidth := m.viewport.Width - 4
-			if wrapWidth < 20 {
-				wrapWidth = 80
+			if wrapWidth < 1 {
+				wrapWidth = 1
 			}
-			wrapped := lipgloss.NewStyle().Width(wrapWidth).Render(content)
+			wrapped := ""
+			if block.kind == displayBlockMarkdown {
+				if block.rendered && block.renderedWidth == wrapWidth {
+					wrapped = block.renderedContent
+				} else {
+					wrapped = m.renderMarkdown(content, wrapWidth)
+					m.blocks[i].renderedContent = wrapped
+					m.blocks[i].renderedWidth = wrapWidth
+					m.blocks[i].rendered = true
+				}
+			} else {
+				wrapped = lipgloss.NewStyle().Width(wrapWidth).Render(content)
+			}
 			for _, line := range strings.Split(wrapped, "\n") {
 				m.lineToBlock = append(m.lineToBlock, i)
 				out = append(out, "  "+line)
@@ -815,7 +1592,86 @@ func (m *model) renderBlocks() string {
 		}
 	}
 
+	m.renderedLines = append([]string(nil), out...)
+	m.applyTextSelection(out)
 	return strings.Join(out, "\n")
+}
+
+func (m *model) renderMarkdown(content string, width int) string {
+	if m.markdownRenderer == nil || m.markdownWidth != width {
+		markdownStyle := styles.DarkStyleConfig
+		markdownStyle.H1.Prefix = ""
+		markdownStyle.H1.Suffix = ""
+		markdownStyle.H2.Prefix = ""
+		markdownStyle.H2.Suffix = ""
+		markdownStyle.H3.Prefix = ""
+		markdownStyle.H3.Suffix = ""
+		markdownStyle.H4.Prefix = ""
+		markdownStyle.H4.Suffix = ""
+		markdownStyle.H5.Prefix = ""
+		markdownStyle.H5.Suffix = ""
+		markdownStyle.H6.Prefix = ""
+		markdownStyle.H6.Suffix = ""
+		renderer, err := glamour.NewTermRenderer(
+			glamour.WithStyles(markdownStyle),
+			glamour.WithWordWrap(width),
+			glamour.WithTableWrap(true),
+		)
+		if err != nil {
+			return lipgloss.NewStyle().Width(width).Render(content)
+		}
+		m.markdownRenderer = renderer
+		m.markdownWidth = width
+	}
+
+	rendered, err := m.markdownRenderer.Render(content)
+	if err != nil {
+		return lipgloss.NewStyle().Width(width).Render(content)
+	}
+	return strings.Trim(rendered, "\r\n")
+}
+
+func (m *model) renderToolStatus(block displayBlock) string {
+	name := cleanDisplayName(block.toolName)
+	if name == "" {
+		name = "tool"
+	}
+	switch block.toolState {
+	case toolDisplaySucceeded:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render("✓ " + name)
+	case toolDisplayFailed:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Render("✗ " + name)
+	case toolDisplayIncomplete:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Render("! " + name)
+	default:
+		return m.spinner.View() + " " + name
+	}
+}
+
+func toolStatusText(block displayBlock) string {
+	name := cleanDisplayName(block.toolName)
+	if name == "" {
+		name = "tool"
+	}
+	marker := "…"
+	switch block.toolState {
+	case toolDisplaySucceeded:
+		marker = "✓"
+	case toolDisplayFailed:
+		marker = "✗"
+	case toolDisplayIncomplete:
+		marker = "!"
+	}
+	return marker + " " + name
+}
+
+func (m *model) hasRunningTools() bool {
+	for _, block := range m.blocks {
+		if block.kind == displayBlockTool && block.toolState == toolDisplayRunning {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *model) resolveTextID(id string, start bool) string {
@@ -928,7 +1784,7 @@ func (m *model) finalizeRun() {
 			m.removeBlock(textBlockKey(id))
 			continue
 		}
-		m.upsertBlock(textBlockKey(id), m.textMessageHeader(id), text)
+		m.upsertMarkdownBlock(textBlockKey(id), m.textMessageHeader(id), text)
 		m.history = append(m.history, agui.ChatMessage{Role: agui.RoleAssistant, Content: text, ID: id, Name: m.textAgentNames[id]})
 	}
 	m.textBuffers = map[string]*strings.Builder{}
@@ -956,7 +1812,119 @@ func (m *model) finalizeRun() {
 	}
 	m.thinkingBuffer.Reset()
 
+	for toolID, buf := range m.toolBuffers {
+		if !buf.complete {
+			m.upsertToolBlock(toolID, buf.name, toolDisplayIncomplete)
+		}
+	}
 	m.toolBuffers = map[string]*toolCallBuffer{}
+}
+
+func (m *model) setRunSession(session *runSession) {
+	m.runSession = session
+	m.activeRunID = session.RunID
+	m.reconnectAttempt = 0
+	m.reconnectDeadline = time.Time{}
+	m.reconnectScheduled = false
+	_ = m.sessionStore.save(session)
+}
+
+func (m *model) clearRunSession() {
+	m.runSession = nil
+	m.activeRunID = ""
+	m.reconnectAttempt = 0
+	m.reconnectDeadline = time.Time{}
+	m.reconnectScheduled = false
+	_ = m.sessionStore.clear()
+}
+
+func (m model) recoverRunCmd() tea.Cmd {
+	session := *m.runSession
+	return func() tea.Msg {
+		history, _ := m.client.GetThreadMessages(context.Background(), session.ThreadID)
+		stream, err := m.client.ConnectRun(context.Background(), agui.RunRequest{
+			RunID:       session.RunID,
+			ThreadID:    session.ThreadID,
+			LastEventID: initialReplayID,
+		})
+		return runStartResultMsg{runSeq: m.runSeq, stream: stream, recoveredHistory: history, err: err}
+	}
+}
+
+func (m *model) handleReconnectableError(err error) (tea.Cmd, bool) {
+	if m.runSession == nil {
+		return nil, false
+	}
+	var httpErr *agui.HTTPError
+	if errors.As(err, &httpErr) {
+		if httpErr.StatusCode == 410 {
+			m.starting = false
+			m.running = false
+			m.status = "Replay expired; loading the latest thread checkpoint..."
+			m.appendSystemBlock("REPLAY_EXPIRED", "", "The saved stream can no longer be replayed.")
+			threadID := m.runSession.ThreadID
+			runSeq := m.runSeq
+			m.clearRunSession()
+			return func() tea.Msg {
+				history, fetchErr := m.client.GetThreadMessages(context.Background(), threadID)
+				return threadRecoveredMsg{runSeq: runSeq, history: history, err: fetchErr}
+			}, true
+		}
+		if !httpErr.Retryable() {
+			return nil, false
+		}
+	}
+	if m.reconnectScheduled {
+		return nil, true
+	}
+	now := time.Now()
+	if m.reconnectDeadline.IsZero() {
+		m.reconnectDeadline = now.Add(reconnectWindow)
+	}
+	if !now.Before(m.reconnectDeadline) {
+		return nil, false
+	}
+
+	m.reconnectAttempt++
+	m.reconnectScheduled = true
+	m.starting = true
+	m.running = true
+	if m.stream != nil {
+		m.stream.Close()
+		m.stream = nil
+	}
+	m.runSeq++
+	remaining := time.Until(m.reconnectDeadline).Round(time.Second)
+	if remaining < time.Second {
+		remaining = time.Second
+	}
+	delay := reconnectDelay(m.reconnectAttempt)
+	if delay > time.Until(m.reconnectDeadline) {
+		delay = time.Until(m.reconnectDeadline)
+	}
+	m.status = fmt.Sprintf("Reconnecting stream... (%s remaining)", remaining)
+	m.runSession.UpdatedAt = now
+	_ = m.sessionStore.save(m.runSession)
+
+	session := *m.runSession
+	history := append([]agui.ChatMessage(nil), m.history...)
+	runSeq := m.runSeq
+	lastEventID := session.LastEventID
+	if lastEventID == "" {
+		lastEventID = initialReplayID
+	}
+	return func() tea.Msg {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		<-timer.C
+		stream, connectErr := m.client.ConnectRun(context.Background(), agui.RunRequest{
+			RunID:       session.RunID,
+			ThreadID:    session.ThreadID,
+			History:     history,
+			LastEventID: lastEventID,
+		})
+		return runStartResultMsg{runSeq: runSeq, stream: stream, err: connectErr}
+	}, true
 }
 
 func (m *model) stopStream() {
@@ -1013,6 +1981,257 @@ func (m *model) handleLeftClick(screenY int) {
 	}
 }
 
+func (m *model) startTextSelection(screenX, screenY int) {
+	if !m.screenYInViewport(screenY) {
+		m.clearTextSelection()
+		return
+	}
+	position, ok := m.textPositionAtScreen(screenX, screenY)
+	if !ok {
+		m.clearTextSelection()
+		return
+	}
+	token := m.selection.scrollToken + 1
+	m.selection = textSelection{
+		anchor:      position,
+		cursor:      position,
+		dragging:    true,
+		scrollToken: token,
+		lastMouseX:  screenX,
+		lastMouseY:  screenY,
+	}
+}
+
+func (m *model) dragTextSelection(screenX, screenY int) tea.Cmd {
+	m.selection.lastMouseX = screenX
+	m.selection.lastMouseY = screenY
+	direction := m.selectionScrollDirection(screenY)
+	if direction != 0 && !m.scrollTextSelection(direction) {
+		direction = 0
+	}
+	if position, ok := m.textPositionAtScreen(screenX, screenY); ok {
+		m.selection.cursor = position
+		m.selection.active = position != m.selection.anchor
+		if m.selection.active {
+			m.selectedBlockIdx = -1
+		}
+	}
+	return m.setSelectionScrollDirection(direction)
+}
+
+func (m *model) finishTextSelection(screenX, screenY int) {
+	if position, ok := m.textPositionAtScreen(screenX, screenY); ok {
+		m.selection.cursor = position
+		m.selection.active = position != m.selection.anchor
+	}
+	m.selection.dragging = false
+	m.setSelectionScrollDirection(0)
+	if m.selection.active {
+		m.selectedBlockIdx = -1
+		m.status = "Text selected; right-click or Ctrl+C to copy"
+	}
+}
+
+func (m *model) handleSelectionScrollTick(msg selectionScrollTickMsg) tea.Cmd {
+	if msg.token != m.selection.scrollToken || !m.selection.dragging || m.selection.scrollDirection == 0 {
+		return nil
+	}
+	if !m.scrollTextSelection(m.selection.scrollDirection) {
+		m.setSelectionScrollDirection(0)
+		return nil
+	}
+	if position, ok := m.textPositionAtScreen(m.selection.lastMouseX, m.selection.lastMouseY); ok {
+		m.selection.cursor = position
+		m.selection.active = position != m.selection.anchor
+		if m.selection.active {
+			m.selectedBlockIdx = -1
+		}
+	}
+	return selectionScrollCmd(msg.token)
+}
+
+func selectionScrollCmd(token uint64) tea.Cmd {
+	return tea.Tick(selectionScrollInterval, func(time.Time) tea.Msg {
+		return selectionScrollTickMsg{token: token}
+	})
+}
+
+func (m *model) setSelectionScrollDirection(direction int) tea.Cmd {
+	if direction == m.selection.scrollDirection {
+		return nil
+	}
+	m.selection.scrollToken++
+	m.selection.scrollDirection = direction
+	if direction == 0 {
+		return nil
+	}
+	return selectionScrollCmd(m.selection.scrollToken)
+}
+
+func (m *model) scrollTextSelection(direction int) bool {
+	previousYOffset := m.viewport.YOffset
+	if direction < 0 {
+		m.viewport.ScrollUp(1)
+	} else {
+		m.viewport.ScrollDown(1)
+	}
+	if m.viewport.YOffset == previousYOffset {
+		return false
+	}
+	m.followOutput = false
+	return true
+}
+
+func (m *model) selectionScrollDirection(screenY int) int {
+	viewportTop := 1
+	viewportBottom := viewportTop + m.viewport.Height - 1
+	switch {
+	case screenY <= viewportTop:
+		return -1
+	case screenY >= viewportBottom:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func (m *model) screenYInViewport(screenY int) bool {
+	viewportTop := 1
+	return screenY >= viewportTop && screenY < viewportTop+m.viewport.Height
+}
+
+func (m *model) textPositionAtScreen(screenX, screenY int) (textPosition, bool) {
+	if len(m.renderedLines) == 0 {
+		return textPosition{}, false
+	}
+	viewportTop := 1
+	viewportBottom := viewportTop + m.viewport.Height - 1
+	if screenY < viewportTop {
+		screenY = viewportTop
+	}
+	if screenY > viewportBottom {
+		screenY = viewportBottom
+	}
+	line := m.viewport.YOffset + screenY - viewportTop
+	if line < 0 {
+		line = 0
+	}
+	if line >= len(m.renderedLines) {
+		line = len(m.renderedLines) - 1
+	}
+	width := ansi.StringWidth(m.renderedLines[line])
+	if screenX < 0 {
+		screenX = 0
+	}
+	if screenX > width {
+		screenX = width
+	}
+	return textPosition{line: line, col: screenX}, true
+}
+
+func (m *model) clearTextSelection() {
+	token := m.selection.scrollToken + 1
+	m.selection = textSelection{scrollToken: token}
+}
+
+func (m *model) selectionBounds() (textPosition, textPosition, bool) {
+	if !m.selection.active {
+		return textPosition{}, textPosition{}, false
+	}
+	start := m.selection.anchor
+	end := m.selection.cursor
+	if end.line < start.line || end.line == start.line && end.col < start.col {
+		start, end = end, start
+	}
+	if start.line < 0 || end.line >= len(m.renderedLines) {
+		return textPosition{}, textPosition{}, false
+	}
+	return start, end, true
+}
+
+func (m *model) applyTextSelection(lines []string) {
+	start, end, ok := m.selectionBounds()
+	if !ok {
+		return
+	}
+	for lineIndex := start.line; lineIndex <= end.line && lineIndex < len(lines); lineIndex++ {
+		lineWidth := ansi.StringWidth(lines[lineIndex])
+		left := 0
+		right := lineWidth
+		if lineIndex == start.line {
+			left = min(start.col, lineWidth)
+		}
+		if lineIndex == end.line {
+			right = min(end.col+1, lineWidth)
+		}
+		if right <= left {
+			continue
+		}
+		before := ansi.Cut(lines[lineIndex], 0, left)
+		// Strip nested Markdown styles inside the selected span so their reset
+		// sequences cannot cancel the reverse-video selection highlight midway.
+		selected := ansi.Strip(ansi.Cut(lines[lineIndex], left, right))
+		after := ansi.Cut(lines[lineIndex], right, lineWidth)
+		lines[lineIndex] = before + "\x1b[7m" + selected + "\x1b[27m" + after
+	}
+}
+
+func (m *model) selectedText() string {
+	start, end, ok := m.selectionBounds()
+	if !ok {
+		return ""
+	}
+	parts := make([]string, 0, end.line-start.line+1)
+	for lineIndex := start.line; lineIndex <= end.line; lineIndex++ {
+		line := ansi.Strip(m.renderedLines[lineIndex])
+		lineWidth := ansi.StringWidth(line)
+		left := 0
+		right := lineWidth
+		if lineIndex == start.line {
+			left = min(start.col, lineWidth)
+		}
+		if lineIndex == end.line {
+			right = min(end.col+1, lineWidth)
+		}
+		part := ""
+		if right > left {
+			part = ansi.Cut(line, left, right)
+		}
+		parts = append(parts, strings.TrimRight(part, " "))
+	}
+	return strings.TrimRight(strings.Join(parts, "\n"), "\n")
+}
+
+func (m *model) copyCurrentSelection() {
+	if m.selection.active {
+		m.copyTextSelection()
+		return
+	}
+	m.copySelectedBlock()
+}
+
+func (m *model) copySelectionAt(screenY int) {
+	if m.selection.active {
+		m.copyTextSelection()
+		return
+	}
+	m.handleLeftClick(screenY)
+	m.copySelectedBlock()
+}
+
+func (m *model) copyTextSelection() {
+	text := m.selectedText()
+	if text == "" {
+		m.status = "No text selected"
+		return
+	}
+	if err := writeClipboard(text); err != nil {
+		m.status = fmt.Sprintf("Copy failed: %v", err)
+		return
+	}
+	m.status = "Selected text copied to clipboard"
+}
+
 func (m *model) copySelectedBlock() {
 	if m.selectedBlockIdx < 0 || m.selectedBlockIdx >= len(m.blocks) {
 		m.status = "No block selected"
@@ -1020,10 +2239,13 @@ func (m *model) copySelectedBlock() {
 	}
 	block := m.blocks[m.selectedBlockIdx]
 	text := block.header
+	if block.kind == displayBlockTool {
+		text = toolStatusText(block)
+	}
 	if content := strings.TrimSpace(block.content); content != "" {
 		text += "\n" + content
 	}
-	if err := clipboard.WriteAll(text); err != nil {
+	if err := writeClipboard(text); err != nil {
 		m.status = fmt.Sprintf("Copy failed: %v", err)
 		return
 	}
@@ -1032,7 +2254,7 @@ func (m *model) copySelectedBlock() {
 
 func (m *model) refreshViewport() {
 	m.viewport.SetContent(m.renderBlocks())
-	if m.running || m.selectedBlockIdx >= 0 {
+	if m.followOutput {
 		m.viewport.GotoBottom()
 	}
 }
@@ -1052,6 +2274,15 @@ func (m *model) layout() {
 	// Border (2) + horizontal padding (2) + textinput prompt/cursor (3) so the
 	// bordered input line fits exactly within the terminal width.
 	m.input.Width = max(10, m.width-7)
+}
+
+func viewportNavigationKeyMap() viewport.KeyMap {
+	return viewport.KeyMap{
+		PageDown: key.NewBinding(key.WithKeys("pgdown"), key.WithHelp("pgdn", "page down")),
+		PageUp:   key.NewBinding(key.WithKeys("pgup"), key.WithHelp("pgup", "page up")),
+		Down:     key.NewBinding(key.WithKeys("down"), key.WithHelp("↓", "down")),
+		Up:       key.NewBinding(key.WithKeys("up"), key.WithHelp("↑", "up")),
+	}
 }
 
 func waitForAsync(ch <-chan tea.Msg) tea.Cmd {
@@ -1088,24 +2319,57 @@ func bridgeStream(runSeq uint64, stream *agui.Stream, out chan<- tea.Msg) {
 	}()
 }
 
+func chatMessagesToAny(messages []agui.ChatMessage) []any {
+	raw, err := json.Marshal(messages)
+	if err != nil {
+		return nil
+	}
+	var converted []any
+	if err := json.Unmarshal(raw, &converted); err != nil {
+		return nil
+	}
+	return converted
+}
+
 func newReplayState(history []agui.ChatMessage) replayState {
 	state := replayState{
 		historicalIDs:          map[string]struct{}{},
 		ignoredTextMessageIDs:  map[string]struct{}{},
 		completedTextMessageID: map[string]struct{}{},
 	}
-	for _, message := range history {
+	state.addHistoricalMessages(history)
+	return state
+}
+
+func (s *replayState) addHistoricalMessages(messages []agui.ChatMessage) {
+	if s.historicalIDs == nil {
+		s.historicalIDs = map[string]struct{}{}
+	}
+	if s.ignoredTextMessageIDs == nil {
+		s.ignoredTextMessageIDs = map[string]struct{}{}
+	}
+	if s.completedTextMessageID == nil {
+		s.completedTextMessageID = map[string]struct{}{}
+	}
+	knownTexts := make(map[string]struct{}, len(s.historicalTexts))
+	for _, text := range s.historicalTexts {
+		knownTexts[text] = struct{}{}
+	}
+	for _, message := range messages {
 		if agui.NormalizeRole(message.Role) != agui.RoleAssistant {
 			continue
 		}
 		if message.ID != "" {
-			state.historicalIDs[normalizeHistoricalTextMessageID(message.ID)] = struct{}{}
+			s.historicalIDs[normalizeHistoricalTextMessageID(message.ID)] = struct{}{}
 		}
 		if text := normalizeReplayText(messageText(message.Content)); text != "" {
-			state.historicalTexts = append(state.historicalTexts, text)
+			if _, exists := knownTexts[text]; exists {
+				continue
+			}
+			s.historicalTexts = append(s.historicalTexts, text)
+			knownTexts[text] = struct{}{}
 		}
 	}
-	return state
 }
 
 func (s replayState) filterReplayText(text string) string {
@@ -1164,36 +2428,26 @@ func messageText(content any) string {
 	}
 }
 
-func formatToolCall(buf *toolCallBuffer) string {
-	name := strings.TrimSpace(buf.name)
-	args := strings.TrimSpace(buf.args.String())
-	result := strings.TrimSpace(buf.result)
-	var parts []string
-	if name != "" {
-		parts = append(parts, name)
+func eventToolCallID(event agui.EventEnvelope) string {
+	if id := strings.TrimSpace(event.ToolCallID); id != "" {
+		return id
 	}
-	if args != "" {
-		parts = append(parts, "args: "+args)
-	}
-	if result != "" {
-		parts = append(parts, "result: "+result)
-		if buf.isError {
-			parts = append(parts, "(error)")
-		}
-	}
-	return strings.Join(parts, " | ")
+	return valueString(event.Raw, "toolCallId")
 }
 
-func eventHeader(eventType, id string) string {
+func eventToolCallName(event agui.EventEnvelope) string {
+	if name := cleanDisplayName(event.ToolCallName); name != "" {
+		return name
+	}
+	return cleanDisplayName(valueString(event.Raw, "toolCallName"))
+}
+
+func eventHeader(eventType, _ string) string {
 	eventType = strings.TrimSpace(eventType)
-	id = strings.TrimSpace(id)
 	if eventType == "" {
 		eventType = "EVENT"
 	}
-	if id == "" {
-		return fmt.Sprintf("[%s]", eventType)
-	}
-	return fmt.Sprintf("[%s] #%s", eventType, shortID(id))
+	return fmt.Sprintf("[%s]", eventType)
 }
 
 func headerWithAgent(header, agentName string) string {

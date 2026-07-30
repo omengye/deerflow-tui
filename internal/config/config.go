@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -14,6 +15,7 @@ type Config struct {
 	Endpoint     string
 	Headers      map[string]string
 	InitialState map[string]any
+	StateDir     string
 }
 
 func LoadFromEnv() (Config, error) {
@@ -35,6 +37,14 @@ func LoadFromEnv() (Config, error) {
 
 	cfg.Headers = headers
 	cfg.InitialState = initial
+	cfg.StateDir = strings.TrimSpace(os.Getenv("DEERFLOW_TUI_STATE_DIR"))
+	if cfg.StateDir == "" {
+		userConfigDir, err := os.UserConfigDir()
+		if err != nil {
+			return Config{}, fmt.Errorf("resolve user config directory: %w", err)
+		}
+		cfg.StateDir = filepath.Join(userConfigDir, "deerflow-tui")
+	}
 	return cfg, nil
 }
 

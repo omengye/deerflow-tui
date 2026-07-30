@@ -28,7 +28,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(tui.NewModel(cfg), tea.WithAltScreen(), tea.WithMouseCellMotion())
+	p := tea.NewProgram(
+		tui.NewModel(cfg),
+		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
+	)
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "deerflow-tui: %v\n", err)
 		os.Exit(1)

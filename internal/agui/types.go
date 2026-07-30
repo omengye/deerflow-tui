@@ -30,12 +30,19 @@ var allowedRoles = map[string]struct{}{
 }
 
 var knownRoleRemaps = map[string]string{
-	"ai":       RoleAssistant,
-	"human":    RoleUser,
-	"function": RoleTool,
+	"ai":                RoleAssistant,
+	"aimessage":         RoleAssistant,
+	"aimessagechunk":    RoleAssistant,
+	"human":             RoleUser,
+	"humanmessage":      RoleUser,
+	"humanmessagechunk": RoleUser,
+	"function":          RoleTool,
+	"toolmessage":       RoleTool,
+	"toolmessagechunk":  RoleTool,
 }
 
 type EventEnvelope struct {
+	SSEID           string
 	Type            string
 	Raw             map[string]any
 	MessageID       string
@@ -84,19 +91,21 @@ type ResumeEntry struct {
 }
 
 type RunAgentInput struct {
-	RunID     string           `json:"runId"`
-	ThreadID  string           `json:"threadId"`
-	State     map[string]any   `json:"state,omitempty"`
-	Messages  []ChatMessage    `json:"messages"`
-	Tools     []map[string]any `json:"tools,omitempty"`
-	Context   map[string]any   `json:"context,omitempty"`
-	Forwarded map[string]any   `json:"forwardedProps,omitempty"`
-	Resume    []ResumeEntry    `json:"resume,omitempty"`
-	Extra     map[string]any   `json:"-"`
+	RunID             string           `json:"runId"`
+	ThreadID          string           `json:"threadId"`
+	State             map[string]any   `json:"state,omitempty"`
+	Messages          []ChatMessage    `json:"messages"`
+	Tools             []map[string]any `json:"tools,omitempty"`
+	Context           map[string]any   `json:"context,omitempty"`
+	Forwarded         map[string]any   `json:"forwardedProps,omitempty"`
+	Resume            []ResumeEntry    `json:"resume,omitempty"`
+	OnDisconnect      string           `json:"onDisconnect"`
+	MultitaskStrategy string           `json:"multitaskStrategy,omitempty"`
+	Extra             map[string]any   `json:"-"`
 }
 
 func NormalizeRole(role string) string {
-	trimmed := strings.TrimSpace(role)
+	trimmed := strings.ToLower(strings.TrimSpace(role))
 	if trimmed == "" {
 		return RoleUser
 	}
@@ -329,15 +338,15 @@ func toolCallsFromSnapshot(raw map[string]any) []ToolCall {
 
 // CancelRunResponse is the response from POST /api/runs/{id}/cancel.
 type CancelRunResponse struct {
-	Success bool             `json:"success"`
-	Run     CancelRunStatus  `json:"run"`
+	Success bool            `json:"success"`
+	Run     CancelRunStatus `json:"run"`
 }
 
 // CancelRunStatus is the run status returned in a cancel response.
 type CancelRunStatus struct {
-	RunID     string `json:"run_id"`
-	ThreadID  string `json:"thread_id"`
-	Status    string `json:"status"`
+	RunID    string `json:"run_id"`
+	ThreadID string `json:"thread_id"`
+	Status   string `json:"status"`
 }
 
 func firstString(raw map[string]any, keys ...string) string {

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -19,6 +20,31 @@ type Stream struct {
 	Events <-chan EventEnvelope
 	Errs   <-chan error
 	cancel context.CancelFunc
+}
+
+type RunRequest struct {
+	RunID       string
+	ThreadID    string
+	History     []ChatMessage
+	Resume      []ResumeEntry
+	LastEventID string
+}
+
+type HTTPError struct {
+	StatusCode int
+	Body       string
+}
+
+type threadDetailResponse struct {
+	Messages []map[string]any `json:"messages"`
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("run request failed: status=%d body=%s", e.StatusCode, e.Body)
+}
+
+func (e *HTTPError) Retryable() bool {
+	return e.StatusCode == http.StatusRequestTimeout || e.StatusCode == http.StatusTooEarly || e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
 }
 
 func (s *Stream) Close() {
@@ -72,19 +98,24 @@ func (c *Client) StartRun(ctx context.Context, threadID string, history []ChatMe
 }
 
 func (c *Client) ResumeRun(ctx context.Context, threadID string, history []ChatMessage, resume []ResumeEntry) (*Stream, error) {
-	runID, err := newID("run")
+	runID, err := NewRunID()
 	if err != nil {
 		return nil, fmt.Errorf("create run id: %w", err)
 	}
+	return c.ConnectRun(ctx, RunRequest{RunID: runID, ThreadID: threadID, History: history, Resume: resume})
+}
 
+func (c *Client) ConnectRun(ctx context.Context, run RunRequest) (*Stream, error) {
 	payload := RunAgentInput{
-		RunID:    runID,
-		ThreadID: threadID,
-		State:    c.initialState,
-		Messages: NormalizeMessages(history),
+		RunID:             run.RunID,
+		ThreadID:          run.ThreadID,
+		State:             c.initialState,
+		Messages:          NormalizeMessages(run.History),
+		OnDisconnect:      "continue",
+		MultitaskStrategy: "interrupt",
 	}
-	if len(resume) > 0 {
-		payload.Resume = resume
+	if len(run.Resume) > 0 {
+		payload.Resume = run.Resume
 	}
 
 	body, err := json.Marshal(payload)
@@ -101,6 +132,9 @@ func (c *Client) ResumeRun(ctx context.Context, threadID string, history []ChatM
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
+	if strings.TrimSpace(run.LastEventID) != "" {
+		req.Header.Set("Last-Event-ID", strings.TrimSpace(run.LastEventID))
+	}
 	for k, v := range c.headers {
 		req.Header.Set(k, v)
 	}
@@ -115,7 +149,7 @@ func (c *Client) ResumeRun(ctx context.Context, threadID string, history []ChatM
 		defer resp.Body.Close()
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 32*1024))
 		cancel()
-		return nil, fmt.Errorf("run request failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return nil, &HTTPError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(raw))}
 	}
 
 	events := make(chan EventEnvelope)
@@ -126,7 +160,7 @@ func (c *Client) ResumeRun(ctx context.Context, threadID string, history []ChatM
 		defer close(errs)
 		defer resp.Body.Close()
 
-		if err := parseSSE(resp.Body, func(data string) {
+		if err := parseSSE(resp.Body, func(eventID, data string) {
 			if strings.TrimSpace(data) == "" {
 				return
 			}
@@ -142,6 +176,7 @@ func (c *Client) ResumeRun(ctx context.Context, threadID string, history []ChatM
 					},
 				}
 			}
+			env.SSEID = eventID
 
 			select {
 			case <-ctx.Done():
@@ -157,7 +192,7 @@ func (c *Client) ResumeRun(ctx context.Context, threadID string, history []ChatM
 		}
 	}()
 
-	return &Stream{RunID: runID, Events: events, Errs: errs, cancel: cancel}, nil
+	return &Stream{RunID: run.RunID, Events: events, Errs: errs, cancel: cancel}, nil
 }
 
 func (c *Client) CancelRun(ctx context.Context, runID string) error {
@@ -186,16 +221,54 @@ func (c *Client) CancelRun(ctx context.Context, runID string) error {
 	return nil
 }
 
-func parseSSE(r io.Reader, onData func(data string)) error {
+func (c *Client) GetThreadMessages(ctx context.Context, threadID string) ([]ChatMessage, error) {
+	requestURL := fmt.Sprintf("%s/threads/%s", c.cancelBaseURL, url.PathEscape(threadID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create thread request: %w", err)
+	}
+	for k, v := range c.headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("thread request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 32*1024))
+		return nil, &HTTPError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(raw))}
+	}
+
+	var detail threadDetailResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4*1024*1024)).Decode(&detail); err != nil {
+		return nil, fmt.Errorf("decode thread response: %w", err)
+	}
+	rawMessages := make([]any, 0, len(detail.Messages))
+	for _, message := range detail.Messages {
+		if _, ok := message["role"]; !ok {
+			if typ, ok := message["type"].(string); ok {
+				message["role"] = NormalizeRole(typ)
+			}
+		}
+		rawMessages = append(rawMessages, message)
+	}
+	return MessagesFromSnapshot(rawMessages), nil
+}
+
+func parseSSE(r io.Reader, onData func(eventID, data string)) error {
 	reader := bufio.NewReader(r)
 	var dataLines []string
+	var eventID string
 
 	flush := func() {
 		if len(dataLines) == 0 {
 			return
 		}
-		onData(strings.Join(dataLines, "\n"))
+		onData(eventID, strings.Join(dataLines, "\n"))
 		dataLines = dataLines[:0]
+		eventID = ""
 	}
 
 	for {
@@ -211,6 +284,8 @@ func parseSSE(r io.Reader, onData func(data string)) error {
 		} else if data, ok := strings.CutPrefix(trimmed, "data:"); ok {
 			data = strings.TrimSpace(data)
 			dataLines = append(dataLines, data)
+		} else if id, ok := strings.CutPrefix(trimmed, "id:"); ok {
+			eventID = strings.TrimSpace(id)
 		}
 
 		if err == io.EOF {
@@ -218,6 +293,10 @@ func parseSSE(r io.Reader, onData func(data string)) error {
 			return nil
 		}
 	}
+}
+
+func NewRunID() (string, error) {
+	return newID("run")
 }
 
 func newID(prefix string) (string, error) {
