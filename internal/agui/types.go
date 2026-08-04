@@ -279,10 +279,13 @@ func MessagesFromSnapshot(raw any) []ChatMessage {
 
 func chatMessageFromSnapshot(raw map[string]any) (ChatMessage, bool) {
 	role, _ := raw["role"].(string)
-	role = NormalizeRole(role)
-	if role == "" {
+	if strings.TrimSpace(role) == "" {
+		role, _ = raw["type"].(string)
+	}
+	if strings.TrimSpace(role) == "" {
 		return ChatMessage{}, false
 	}
+	role = NormalizeRole(role)
 	message := ChatMessage{
 		Role:    role,
 		Content: raw["content"],
@@ -291,6 +294,9 @@ func chatMessageFromSnapshot(raw map[string]any) (ChatMessage, bool) {
 	message.Name, _ = raw["name"].(string)
 	message.ToolCallID = firstString(raw, "toolCallId", "tool_call_id")
 	message.Error, _ = raw["error"].(string)
+	if message.Content == nil && role == RoleReasoning {
+		message.Content = raw["text"]
+	}
 	if message.Content == nil {
 		message.Content = ""
 	}

@@ -52,3 +52,25 @@ func TestMessagesFromSnapshotPreservesToolResults(t *testing.T) {
 		t.Fatalf("tool result was not preserved: %#v", messages[1])
 	}
 }
+
+func TestMessagesFromSnapshotAcceptsReasoningTypeAndText(t *testing.T) {
+	messages := MessagesFromSnapshot([]any{
+		map[string]any{"id": "r1", "type": "reasoning", "text": "saved plan"},
+	})
+
+	if len(messages) != 1 {
+		t.Fatalf("expected one reasoning message, got %#v", messages)
+	}
+	if messages[0].Role != RoleReasoning || messages[0].Content != "saved plan" || messages[0].ID != "r1" {
+		t.Fatalf("reasoning message was not preserved: %#v", messages[0])
+	}
+}
+
+func TestMessagesFromSnapshotSkipsEntriesWithoutRoleOrType(t *testing.T) {
+	messages := MessagesFromSnapshot([]any{
+		map[string]any{"id": "unknown", "content": "must not become a user message"},
+	})
+	if len(messages) != 0 {
+		t.Fatalf("snapshot entry without role/type was incorrectly imported: %#v", messages)
+	}
+}

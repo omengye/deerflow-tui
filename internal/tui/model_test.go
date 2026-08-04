@@ -109,14 +109,149 @@ func TestReplayFilterStripsHistoricalPrefix(t *testing.T) {
 	}
 }
 
-func TestThinkingTextMessageEventsRenderThinkingBlock(t *testing.T) {
+func TestNestedThinkingLifecycleRetainsCompletedBlock(t *testing.T) {
 	m := newTestModel()
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_START", Raw: map[string]any{"type": "THINKING_START"}})
 	m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_START", Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_START"}})
 	m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_CONTENT", Delta: "plan", Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_CONTENT", "delta": "plan"}})
 	m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_END", Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_END"}})
 
-	if got := m.renderBlocks(); !strings.Contains(got, "[THINKING]") || !strings.Contains(got, "plan") {
-		t.Fatalf("thinking block missing:\n%s", got)
+	if got := m.renderBlocks(); !strings.Contains(got, "Thinking") || !strings.Contains(got, "plan") || !m.hasRunningActivities() {
+		t.Fatalf("thinking block should remain active until the outer lifecycle ends:\n%s", got)
+	}
+
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_END", Raw: map[string]any{"type": "THINKING_END"}})
+
+	if got := m.renderBlocks(); !strings.Contains(got, "▸ ✓ Thinking") || strings.Contains(got, "plan") || m.hasRunningActivities() {
+		t.Fatalf("completed thinking block was not retained and collapsed:\n%s", got)
+	}
+	if len(m.blocks) != 1 || !m.blocks[0].collapsed || m.blocks[0].content != "plan" {
+		t.Fatalf("completed thinking content was not retained behind the collapsed block: %#v", m.blocks)
+	}
+	if len(m.history) != 1 || m.history[0].Role != agui.RoleReasoning || m.history[0].Content != "plan" {
+		t.Fatalf("completed thinking was not recorded in history: %#v", m.history)
+	}
+}
+
+func TestInnerOnlyThinkingLifecycleStillCompletes(t *testing.T) {
+	m := newTestModel()
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_START", Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_START"}})
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_CONTENT", Delta: "legacy plan", Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_CONTENT", "delta": "legacy plan"}})
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_END", Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_END"}})
+
+	if got := m.renderBlocks(); !strings.Contains(got, "▸ ✓ Thinking") || strings.Contains(got, "legacy plan") {
+		t.Fatalf("inner-only thinking lifecycle did not complete in a collapsed state:\n%s", got)
+	}
+}
+
+func TestCtrlETogglesSelectedCompletedThinkingBlock(t *testing.T) {
+	m := newTestModel()
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_START", Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_START"}})
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_CONTENT", Delta: "toggle plan", Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_CONTENT", "delta": "toggle plan"}})
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_END", Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_END"}})
+	m.selectedBlockIdx = 0
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlE})
+	m = updated.(model)
+	if got := m.renderBlocks(); !strings.Contains(got, "▾ ✓ Thinking") || !strings.Contains(got, "toggle plan") || m.blocks[0].collapsed {
+		t.Fatalf("ctrl+e did not expand the selected thinking block:\n%s", got)
+	}
+	if m.status != "Thinking expanded" {
+		t.Fatalf("unexpected expand status: %q", m.status)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlE})
+	m = updated.(model)
+	if got := m.renderBlocks(); !strings.Contains(got, "▸ ✓ Thinking") || strings.Contains(got, "toggle plan") || !m.blocks[0].collapsed {
+		t.Fatalf("ctrl+e did not collapse the selected thinking block:\n%s", got)
+	}
+}
+
+func TestCollapsedThinkingCopyIncludesFullContent(t *testing.T) {
+	m := newTestModel()
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_START", Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_START"}})
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_CONTENT", Delta: "hidden full plan", Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_CONTENT", "delta": "hidden full plan"}})
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_END", Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_END"}})
+	m.selectedBlockIdx = 0
+
+	originalWriteClipboard := writeClipboard
+	defer func() { writeClipboard = originalWriteClipboard }()
+	copied := ""
+	writeClipboard = func(text string) error {
+		copied = text
+		return nil
+	}
+	m.copySelectedBlock()
+
+	if !strings.Contains(copied, "✓ Thinking") || !strings.Contains(copied, "hidden full plan") {
+		t.Fatalf("collapsed thinking copy omitted full content: %q", copied)
+	}
+}
+
+func TestCtrlEDoesNotCollapseRunningThinkingBlock(t *testing.T) {
+	m := newTestModel()
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_START", Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_START"}})
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_CONTENT", Delta: "still running", Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_CONTENT", "delta": "still running"}})
+	m.selectedBlockIdx = 0
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlE})
+	m = updated.(model)
+	if m.blocks[0].collapsed || !strings.Contains(m.renderBlocks(), "still running") || m.status != "Thinking is still running" {
+		t.Fatalf("running thinking block was incorrectly collapsed: %#v", m.blocks[0])
+	}
+}
+
+func TestMultipleThinkingLifecyclesCreateSeparateBlocks(t *testing.T) {
+	m := newTestModel()
+	for _, text := range []string{"first plan", "second plan"} {
+		m.handleEvent(agui.EventEnvelope{Type: "THINKING_START", Raw: map[string]any{"type": "THINKING_START"}})
+		m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_CONTENT", Delta: text, Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_CONTENT", "delta": text}})
+		m.handleEvent(agui.EventEnvelope{Type: "THINKING_END", Raw: map[string]any{"type": "THINKING_END"}})
+	}
+
+	got := m.renderBlocks()
+	if strings.Count(got, "✓ Thinking") != 2 || strings.Contains(got, "first plan") || strings.Contains(got, "second plan") {
+		t.Fatalf("thinking lifecycles overwrote each other:\n%s", got)
+	}
+	if len(m.blocks) != 2 || m.blocks[0].content != "first plan" || m.blocks[1].content != "second plan" || !m.blocks[0].collapsed || !m.blocks[1].collapsed {
+		t.Fatalf("thinking blocks did not retain separate collapsed content: %#v", m.blocks)
+	}
+}
+
+func TestNestedReasoningLifecycleRetainsCompletedBlock(t *testing.T) {
+	m := newTestModel()
+	m.handleEvent(agui.EventEnvelope{Type: "REASONING_START", MessageID: "r1", Raw: map[string]any{"type": "REASONING_START", "messageId": "r1"}})
+	m.handleEvent(agui.EventEnvelope{Type: "REASONING_MESSAGE_START", MessageID: "r1", Raw: map[string]any{"type": "REASONING_MESSAGE_START", "messageId": "r1"}})
+	m.handleEvent(agui.EventEnvelope{Type: "REASONING_MESSAGE_CONTENT", MessageID: "r1", Delta: "reason", Raw: map[string]any{"type": "REASONING_MESSAGE_CONTENT", "messageId": "r1", "delta": "reason"}})
+	m.handleEvent(agui.EventEnvelope{Type: "REASONING_MESSAGE_END", MessageID: "r1", Raw: map[string]any{"type": "REASONING_MESSAGE_END", "messageId": "r1"}})
+	m.handleEvent(agui.EventEnvelope{Type: "REASONING_END", MessageID: "r1", Raw: map[string]any{"type": "REASONING_END", "messageId": "r1"}})
+
+	if got := m.renderBlocks(); !strings.Contains(got, "▸ ✓ Reasoning") || strings.Contains(got, "reason") {
+		t.Fatalf("completed reasoning block was not retained and collapsed:\n%s", got)
+	}
+}
+
+func TestCompletedReasoningReplayByIDIsIgnored(t *testing.T) {
+	m := newTestModel()
+	sequence := func(text string) {
+		m.handleEvent(agui.EventEnvelope{Type: "REASONING_START", MessageID: "r1", Raw: map[string]any{"type": "REASONING_START", "messageId": "r1"}})
+		m.handleEvent(agui.EventEnvelope{Type: "REASONING_MESSAGE_START", MessageID: "r1", Raw: map[string]any{"type": "REASONING_MESSAGE_START", "messageId": "r1"}})
+		m.handleEvent(agui.EventEnvelope{Type: "REASONING_MESSAGE_CONTENT", MessageID: "r1", Delta: text, Raw: map[string]any{"type": "REASONING_MESSAGE_CONTENT", "messageId": "r1", "delta": text}})
+		m.handleEvent(agui.EventEnvelope{Type: "REASONING_MESSAGE_END", MessageID: "r1", Raw: map[string]any{"type": "REASONING_MESSAGE_END", "messageId": "r1"}})
+		m.handleEvent(agui.EventEnvelope{Type: "REASONING_END", MessageID: "r1", Raw: map[string]any{"type": "REASONING_END", "messageId": "r1"}})
+	}
+	sequence("original reason")
+	sequence("replayed reason")
+
+	got := m.renderBlocks()
+	if strings.Count(got, "✓ Reasoning") != 1 || strings.Contains(got, "original reason") || strings.Contains(got, "replayed reason") {
+		t.Fatalf("completed reasoning replay was not ignored:\n%s", got)
+	}
+	if len(m.blocks) != 1 || m.blocks[0].content != "original reason" {
+		t.Fatalf("reasoning replay replaced the retained content: %#v", m.blocks)
+	}
+	if len(m.history) != 1 {
+		t.Fatalf("reasoning replay duplicated history: %#v", m.history)
 	}
 }
 
@@ -274,6 +409,18 @@ func TestRunFinishedDoesNotDumpPayload(t *testing.T) {
 	}
 }
 
+func TestRunFinishMarksUnclosedThinkingIncomplete(t *testing.T) {
+	m := newTestModel()
+	m.running = true
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_START", Raw: map[string]any{"type": "THINKING_START"}})
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_CONTENT", Delta: "partial plan", Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_CONTENT", "delta": "partial plan"}})
+	m.handleEvent(agui.EventEnvelope{Type: "RUN_FINISHED", Raw: map[string]any{"type": "RUN_FINISHED", "runId": "run-1"}})
+
+	if got := m.renderBlocks(); !strings.Contains(got, "▸ ! Thinking") || strings.Contains(got, "partial plan") {
+		t.Fatalf("unclosed thinking block should be retained as incomplete and collapsed:\n%s", got)
+	}
+}
+
 func TestMessagesSnapshotImportsHistory(t *testing.T) {
 	m := newTestModel()
 	raw := []any{
@@ -305,6 +452,92 @@ func TestMessagesSnapshotImportsHistory(t *testing.T) {
 	}
 	if strings.Contains(got, "MESSAGES_SNAPSHOT") || strings.Contains(got, "imported 2 messages") || strings.Contains(got, "[SYSTEM]") {
 		t.Fatalf("snapshot event should not be rendered:\n%s", got)
+	}
+}
+
+func TestMessagesSnapshotRestoresReasoningHistory(t *testing.T) {
+	m := newTestModel()
+	raw := []any{
+		map[string]any{"id": "u1", "role": "user", "content": "hello"},
+		map[string]any{"id": "r1", "role": "reasoning", "content": "saved plan", "name": "Thinking"},
+		map[string]any{"id": "a1", "role": "assistant", "content": "answer"},
+	}
+	m.handleEvent(agui.EventEnvelope{Type: "MESSAGES_SNAPSHOT", Raw: map[string]any{"type": "MESSAGES_SNAPSHOT", "messages": raw}})
+
+	if got := m.renderBlocks(); !strings.Contains(got, "▸ ✓ Thinking") || strings.Contains(got, "saved plan") {
+		t.Fatalf("reasoning history was not restored from snapshot in a collapsed state:\n%s", got)
+	}
+	if len(m.history) != 3 || m.history[1].Role != agui.RoleReasoning {
+		t.Fatalf("unexpected reasoning snapshot history: %#v", m.history)
+	}
+}
+
+func TestSnapshotDoesNotDiscardLocallyCompletedReasoning(t *testing.T) {
+	m := newTestModel()
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_START", Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_START"}})
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_CONTENT", Delta: "local plan", Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_CONTENT", "delta": "local plan"}})
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_END", Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_END"}})
+	m.handleEvent(agui.EventEnvelope{Type: "MESSAGES_SNAPSHOT", Raw: map[string]any{
+		"type": "MESSAGES_SNAPSHOT",
+		"messages": []any{
+			map[string]any{"id": "u1", "role": "user", "content": "hello"},
+		},
+	}})
+
+	if got := m.renderBlocks(); !strings.Contains(got, "▸ ✓ Thinking") || strings.Contains(got, "local plan") {
+		t.Fatalf("snapshot discarded or expanded locally completed reasoning:\n%s", got)
+	}
+}
+
+func TestSnapshotPreservesThinkingBeforeToolDisplayOrder(t *testing.T) {
+	m := newTestModel()
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_START", Raw: map[string]any{"type": "THINKING_START"}})
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_START", Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_START"}})
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_CONTENT", Delta: "plan before tool", Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_CONTENT", "delta": "plan before tool"}})
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_TEXT_MESSAGE_END", Raw: map[string]any{"type": "THINKING_TEXT_MESSAGE_END"}})
+	m.handleEvent(agui.EventEnvelope{Type: "TOOL_CALL_START", ToolCallID: "tc1", ToolCallName: "search", Raw: map[string]any{"type": "TOOL_CALL_START", "toolCallId": "tc1", "toolCallName": "search"}})
+	m.handleEvent(agui.EventEnvelope{Type: "TOOL_CALL_RESULT", ToolCallID: "tc1", Content: `{"ok":true}`, Raw: map[string]any{"type": "TOOL_CALL_RESULT", "toolCallId": "tc1", "content": `{"ok":true}`, "role": "tool"}})
+	m.handleEvent(agui.EventEnvelope{Type: "THINKING_END", Raw: map[string]any{"type": "THINKING_END"}})
+
+	if len(m.blocks) != 2 || m.blocks[0].kind != displayBlockReasoning || m.blocks[1].kind != displayBlockTool {
+		t.Fatalf("unexpected live display order before snapshot: %#v", m.blocks)
+	}
+	raw := []any{
+		map[string]any{"id": "a1", "role": "assistant", "content": "", "toolCalls": []any{
+			map[string]any{"id": "tc1", "function": map[string]any{"name": "search", "arguments": `{}`}},
+		}},
+		map[string]any{"id": "t1", "role": "tool", "toolCallId": "tc1", "content": `{"ok":true}`},
+	}
+	m.handleEvent(agui.EventEnvelope{Type: "MESSAGES_SNAPSHOT", Raw: map[string]any{"type": "MESSAGES_SNAPSHOT", "messages": raw}})
+
+	if len(m.blocks) != 2 || m.blocks[0].kind != displayBlockReasoning || m.blocks[1].kind != displayBlockTool {
+		t.Fatalf("snapshot moved thinking below its tool call: %#v", m.blocks)
+	}
+	if got := m.renderBlocks(); strings.Index(got, "✓ Thinking") > strings.Index(got, "✓ search") {
+		t.Fatalf("rendered snapshot order changed after thinking collapsed:\n%s", got)
+	}
+}
+
+func TestSnapshotPreservesExpandedThinkingState(t *testing.T) {
+	m := newTestModel()
+	m.handleEvent(agui.EventEnvelope{Type: "REASONING_MESSAGE_START", MessageID: "r1", Raw: map[string]any{"type": "REASONING_MESSAGE_START", "messageId": "r1"}})
+	m.handleEvent(agui.EventEnvelope{Type: "REASONING_MESSAGE_CONTENT", MessageID: "r1", Delta: "expanded plan", Raw: map[string]any{"type": "REASONING_MESSAGE_CONTENT", "messageId": "r1", "delta": "expanded plan"}})
+	m.handleEvent(agui.EventEnvelope{Type: "REASONING_MESSAGE_END", MessageID: "r1", Raw: map[string]any{"type": "REASONING_MESSAGE_END", "messageId": "r1"}})
+	m.selectedBlockIdx = 0
+	m.toggleSelectedReasoning()
+
+	m.handleEvent(agui.EventEnvelope{Type: "MESSAGES_SNAPSHOT", Raw: map[string]any{
+		"type": "MESSAGES_SNAPSHOT",
+		"messages": []any{
+			map[string]any{"id": "r1", "role": "reasoning", "content": "expanded plan", "name": "Reasoning"},
+		},
+	}})
+
+	if len(m.blocks) != 1 || m.blocks[0].collapsed || m.selectedBlockIdx != 0 {
+		t.Fatalf("snapshot reset expanded thinking UI state: blocks=%#v selected=%d", m.blocks, m.selectedBlockIdx)
+	}
+	if got := m.renderBlocks(); !strings.Contains(got, "expanded plan") || !strings.Contains(got, "▾ ✓ Reasoning") {
+		t.Fatalf("expanded thinking was not preserved across snapshot:\n%s", got)
 	}
 }
 

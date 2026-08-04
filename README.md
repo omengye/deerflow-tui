@@ -73,11 +73,12 @@ scripts/
 | `/new` | 新建线程 |
 | 左键点击选中消息 | ✅ |
 | `Ctrl+C` 复制消息内容到剪贴板 | ✅ |
+| `Ctrl+E` 展开/折叠选中的已完成思考块 | ✅ |
 | 左键拖动选择文本（到视图区边缘自动滚动），右键或 `Ctrl+C` 复制 | ✅ |
 | `Ctrl+V` 粘贴多行文本时显示 `[paste N lines]`，按 `Enter` 后作为一条消息发送 | ✅ |
 | TEXT_MESSAGE 流式事件 | ✅ |
-| REASONING 事件 | ✅ |
-| THINKING 事件 | ✅ |
+| REASONING 事件（完成后自动折叠） | ✅ |
+| THINKING 事件（完成后自动折叠） | ✅ |
 | TOOL_CALL 生命周期（start/args/end/result） | ✅ |
 | STATE_SNAPSHOT / STATE_DELTA | ✅ |
 | MESSAGES_SNAPSHOT 历史导入 | ✅ |

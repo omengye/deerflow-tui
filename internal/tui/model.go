@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/key"
@@ -46,6 +47,7 @@ const (
 	displayBlockPlain displayBlockKind = iota
 	displayBlockMarkdown
 	displayBlockTool
+	displayBlockReasoning
 )
 
 type toolDisplayState uint8
@@ -55,6 +57,14 @@ const (
 	toolDisplaySucceeded
 	toolDisplayFailed
 	toolDisplayIncomplete
+)
+
+type reasoningDisplayState uint8
+
+const (
+	reasoningDisplayRunning reasoningDisplayState = iota
+	reasoningDisplaySucceeded
+	reasoningDisplayIncomplete
 )
 
 type runStartResultMsg struct {
@@ -140,6 +150,9 @@ type displayBlock struct {
 	kind            displayBlockKind
 	toolName        string
 	toolState       toolDisplayState
+	reasoningName   string
+	reasoningState  reasoningDisplayState
+	collapsed       bool
 	renderedContent string
 	renderedWidth   int
 	rendered        bool
@@ -155,11 +168,20 @@ type toolCallBuffer struct {
 	complete bool
 }
 
+type reasoningPartBuffer struct {
+	name        string
+	content     strings.Builder
+	outerActive bool
+}
+
 type replayState struct {
 	historicalIDs          map[string]struct{}
 	historicalTexts        []string
+	historicalReasoning    []string
 	ignoredTextMessageIDs  map[string]struct{}
 	completedTextMessageID map[string]struct{}
+	ignoredReasoningIDs    map[string]struct{}
+	completedReasoningIDs  map[string]struct{}
 }
 
 type model struct {
@@ -213,10 +235,9 @@ type model struct {
 	textAgentNames  map[string]string
 	activeTextID    string
 	textPartCounter int
-	reasoningBuffer map[string]*strings.Builder
+	reasoningBuffer map[string]*reasoningPartBuffer
 	activeReasonID  string
 	reasonCounter   int
-	thinkingBuffer  strings.Builder
 	toolBuffers     map[string]*toolCallBuffer
 	toolCounter     int
 }
@@ -252,7 +273,7 @@ func NewModel(cfg config.Config) tea.Model {
 		replay:                     newReplayState(nil),
 		textBuffers:                map[string]*strings.Builder{},
 		textAgentNames:             map[string]string{},
-		reasoningBuffer:            map[string]*strings.Builder{},
+		reasoningBuffer:            map[string]*reasoningPartBuffer{},
 		toolBuffers:                map[string]*toolCallBuffer{},
 		selectedBlockIdx:           -1,
 	}
@@ -277,7 +298,7 @@ func (m model) Init() tea.Cmd {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
-	hadRunningTools := m.hasRunningTools()
+	hadRunningActivities := m.hasRunningActivities()
 	previousYOffset := m.viewport.YOffset
 	manualScrollUp := false
 	manualScrollDown := false
@@ -337,6 +358,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(cmds...)
 		case keyMatches(msg, "ctrl+v"):
 			return m, readClipboardCmd(0)
+		case keyMatches(msg, "ctrl+e"):
+			m.toggleSelectedReasoning()
+			m.refreshViewport()
+			return m, tea.Batch(cmds...)
 		case keyMatches(msg, "ctrl+c"):
 			m.copyCurrentSelection()
 		case keyMatches(msg, "esc"):
@@ -387,7 +412,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case spinner.TickMsg:
-		if m.hasRunningTools() {
+		if m.hasRunningActivities() {
 			var spinnerCmd tea.Cmd
 			m.spinner, spinnerCmd = m.spinner.Update(msg)
 			if spinnerCmd != nil {
@@ -589,7 +614,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if manualScrollDown && m.viewport.AtBottom() {
 		m.followOutput = true
 	}
-	if !hadRunningTools && m.hasRunningTools() {
+	if !hadRunningActivities && m.hasRunningActivities() {
 		cmds = append(cmds, m.spinner.Tick)
 	}
 
@@ -1162,46 +1187,35 @@ func (m *model) handleEvent(event agui.EventEnvelope) {
 		delete(m.textAgentNames, id)
 		m.clearActiveText(id)
 
-	case "THINKING_START", "THINKING_TEXT_MESSAGE_START":
-		m.thinkingBuffer.Reset()
-		title := valueString(event.Raw, "title")
-		m.upsertBlock("thinking", "[THINKING]", title)
+	case "THINKING_START":
+		m.startReasoningPart(event, "Thinking", true)
+
+	case "THINKING_TEXT_MESSAGE_START":
+		m.startReasoningPart(event, "Thinking", false)
 
 	case "THINKING_TEXT_MESSAGE_CONTENT":
-		m.thinkingBuffer.WriteString(event.Delta)
-		m.upsertBlock("thinking", "[THINKING]", m.thinkingBuffer.String())
+		m.appendReasoningContent(event, "Thinking")
 
-	case "THINKING_TEXT_MESSAGE_END", "THINKING_END":
-		thinking := strings.TrimSpace(m.thinkingBuffer.String())
-		if thinking != "" {
-			m.upsertBlock("thinking", "[THINKING]", thinking)
-		} else {
-			m.removeBlock("thinking")
-		}
-		m.thinkingBuffer.Reset()
+	case "THINKING_TEXT_MESSAGE_END":
+		m.endReasoningPart(event, false)
 
-	case "REASONING_START", "REASONING_MESSAGE_START":
-		id := m.resolveReasoningID(event.MessageID, true)
-		m.ensureReasoningBuffer(id)
-		m.upsertBlock(reasoningBlockKey(id), eventHeader("REASONING", id), "")
+	case "THINKING_END":
+		m.endReasoningPart(event, true)
+
+	case "REASONING_START":
+		m.startReasoningPart(event, "Reasoning", true)
+
+	case "REASONING_MESSAGE_START":
+		m.startReasoningPart(event, "Reasoning", false)
 
 	case "REASONING_MESSAGE_CONTENT":
-		id := m.resolveReasoningID(event.MessageID, false)
-		buf := m.ensureReasoningBuffer(id)
-		buf.WriteString(event.Delta)
-		m.upsertBlock(reasoningBlockKey(id), eventHeader("REASONING", id), buf.String())
+		m.appendReasoningContent(event, "Reasoning")
 
-	case "REASONING_MESSAGE_END", "REASONING_END":
-		id := m.resolveReasoningID(event.MessageID, false)
-		buf := m.ensureReasoningBuffer(id)
-		reasoning := strings.TrimSpace(m.replay.filterReplayText(buf.String()))
-		if reasoning != "" {
-			m.upsertBlock(reasoningBlockKey(id), eventHeader("REASONING", id), reasoning)
-		} else {
-			m.removeBlock(reasoningBlockKey(id))
-		}
-		delete(m.reasoningBuffer, id)
-		m.clearActiveReasoning(id)
+	case "REASONING_MESSAGE_END":
+		m.endReasoningPart(event, false)
+
+	case "REASONING_END":
+		m.endReasoningPart(event, true)
 
 	case "TOOL_CALL_START":
 		toolID := m.resolveToolID(eventToolCallID(event))
@@ -1358,6 +1372,10 @@ func (m *model) importMessagesSnapshot(raw any) {
 	if len(messages) == 0 {
 		return
 	}
+	messages = mergeReasoningHistory(messages, m.history)
+	previousBlocks := m.blocks
+	previousBlockIndexes := m.blockIndexes
+	previousSelectedBlock := m.selectedBlockIdx
 	m.clearTextSelection()
 	m.replay.addHistoricalMessages(messages)
 	for id := range m.textBuffers {
@@ -1375,6 +1393,160 @@ func (m *model) importMessagesSnapshot(raw any) {
 	for _, message := range messages {
 		m.renderHistoryMessage(message)
 	}
+	for id, part := range m.reasoningBuffer {
+		m.upsertReasoningBlock(id, part.name, m.replay.filterReasoningReplayText(part.content.String()), reasoningDisplayRunning)
+	}
+	m.blocks, m.blockIndexes, m.selectedBlockIdx = reconcileSnapshotBlocks(
+		previousBlocks,
+		previousBlockIndexes,
+		previousSelectedBlock,
+		m.blocks,
+		m.blockIndexes,
+	)
+}
+
+type indexedDisplayBlock struct {
+	block displayBlock
+	key   string
+	index int
+}
+
+func reconcileSnapshotBlocks(
+	previousBlocks []displayBlock,
+	previousIndexes map[string]int,
+	previousSelected int,
+	rebuiltBlocks []displayBlock,
+	rebuiltIndexes map[string]int,
+) ([]displayBlock, map[string]int, int) {
+	previousKeys := displayBlockKeysByIndex(previousIndexes)
+	rebuiltKeys := displayBlockKeysByIndex(rebuiltIndexes)
+	keyed := make(map[string]indexedDisplayBlock, len(rebuiltIndexes))
+	byFingerprint := map[string][]indexedDisplayBlock{}
+	for index, block := range rebuiltBlocks {
+		candidate := indexedDisplayBlock{block: block, key: rebuiltKeys[index], index: index}
+		if candidate.key != "" {
+			keyed[candidate.key] = candidate
+		}
+		fingerprint := displayBlockFingerprint(block)
+		byFingerprint[fingerprint] = append(byFingerprint[fingerprint], candidate)
+	}
+
+	used := make([]bool, len(rebuiltBlocks))
+	reconciled := make([]displayBlock, 0, len(rebuiltBlocks))
+	reconciledKeys := make([]string, 0, len(rebuiltBlocks))
+	selected := -1
+	for previousIndex, previous := range previousBlocks {
+		var candidate indexedDisplayBlock
+		matched := false
+		if key := previousKeys[previousIndex]; key != "" {
+			candidate, matched = keyed[key]
+		}
+		if !matched {
+			fingerprint := displayBlockFingerprint(previous)
+			queue := byFingerprint[fingerprint]
+			for len(queue) > 0 && used[queue[0].index] {
+				queue = queue[1:]
+			}
+			if len(queue) > 0 {
+				candidate = queue[0]
+				byFingerprint[fingerprint] = queue[1:]
+				matched = true
+			}
+		}
+		if !matched || used[candidate.index] {
+			continue
+		}
+
+		candidate.block = preserveDisplayBlockUIState(previous, candidate.block)
+		used[candidate.index] = true
+		if previousIndex == previousSelected {
+			selected = len(reconciled)
+		}
+		reconciled = append(reconciled, candidate.block)
+		reconciledKeys = append(reconciledKeys, candidate.key)
+	}
+
+	for index, block := range rebuiltBlocks {
+		if used[index] {
+			continue
+		}
+		reconciled = append(reconciled, block)
+		reconciledKeys = append(reconciledKeys, rebuiltKeys[index])
+	}
+
+	indexes := make(map[string]int, len(rebuiltIndexes))
+	for index, key := range reconciledKeys {
+		if key != "" {
+			indexes[key] = index
+		}
+	}
+	return reconciled, indexes, selected
+}
+
+func displayBlockKeysByIndex(indexes map[string]int) map[int]string {
+	keys := make(map[int]string, len(indexes))
+	for key, index := range indexes {
+		keys[index] = key
+	}
+	return keys
+}
+
+func displayBlockFingerprint(block displayBlock) string {
+	return fmt.Sprintf(
+		"%d\x00%s\x00%s\x00%s\x00%s",
+		block.kind,
+		block.header,
+		block.content,
+		block.toolName,
+		block.reasoningName,
+	)
+}
+
+func preserveDisplayBlockUIState(previous, rebuilt displayBlock) displayBlock {
+	if previous.kind == displayBlockReasoning && rebuilt.kind == displayBlockReasoning &&
+		previous.reasoningState != reasoningDisplayRunning && rebuilt.reasoningState != reasoningDisplayRunning {
+		rebuilt.collapsed = previous.collapsed
+	}
+	return rebuilt
+}
+
+func mergeReasoningHistory(snapshot, current []agui.ChatMessage) []agui.ChatMessage {
+	merged := append([]agui.ChatMessage(nil), snapshot...)
+	knownIDs := map[string]struct{}{}
+	knownTexts := map[string]struct{}{}
+	for _, message := range snapshot {
+		if agui.NormalizeRole(message.Role) != agui.RoleReasoning {
+			continue
+		}
+		if message.ID != "" {
+			knownIDs[message.ID] = struct{}{}
+		}
+		if text := normalizeReplayText(messageText(message.Content)); text != "" {
+			knownTexts[text] = struct{}{}
+		}
+	}
+	for _, message := range current {
+		if agui.NormalizeRole(message.Role) != agui.RoleReasoning {
+			continue
+		}
+		if message.ID != "" {
+			if _, exists := knownIDs[message.ID]; exists {
+				continue
+			}
+		}
+		text := normalizeReplayText(messageText(message.Content))
+		if _, exists := knownTexts[text]; text != "" && exists {
+			continue
+		}
+		merged = append(merged, message)
+		if message.ID != "" {
+			knownIDs[message.ID] = struct{}{}
+		}
+		if text != "" {
+			knownTexts[text] = struct{}{}
+		}
+	}
+	return merged
 }
 
 func (m *model) renderHistoryMessage(message agui.ChatMessage) {
@@ -1410,6 +1582,21 @@ func (m *model) renderHistoryMessage(message agui.ChatMessage) {
 			state = toolDisplayFailed
 		}
 		m.upsertToolBlock(toolID, buf.name, state)
+	case agui.RoleReasoning:
+		text := messageText(message.Content)
+		if strings.TrimSpace(text) == "" {
+			return
+		}
+		id := strings.TrimSpace(message.ID)
+		if id == "" {
+			m.reasonCounter++
+			id = fmt.Sprintf("reasoning-history-%d", m.reasonCounter)
+		}
+		name := cleanDisplayName(message.Name)
+		if name == "" {
+			name = "Thinking"
+		}
+		m.upsertReasoningBlock(id, name, text, reasoningDisplaySucceeded)
 	case agui.RoleSystem:
 		// system messages are not displayed
 	}
@@ -1549,6 +1736,31 @@ func (m *model) upsertToolBlock(toolID, name string, state toolDisplayState) {
 	m.upsertDisplayBlock(key, displayBlock{kind: displayBlockTool, toolName: name, toolState: state})
 }
 
+func (m *model) upsertReasoningBlock(id, name, content string, state reasoningDisplayState) {
+	key := reasoningBlockKey(id)
+	name = cleanDisplayName(name)
+	collapsed := state != reasoningDisplayRunning
+	if idx, ok := m.blockIndexes[key]; ok && idx >= 0 && idx < len(m.blocks) {
+		existing := m.blocks[idx]
+		if name == "" {
+			name = existing.reasoningName
+		}
+		if state != reasoningDisplayRunning && existing.reasoningState != reasoningDisplayRunning {
+			collapsed = existing.collapsed
+		}
+	}
+	if name == "" {
+		name = "Thinking"
+	}
+	m.upsertDisplayBlock(key, displayBlock{
+		kind:           displayBlockReasoning,
+		content:        strings.TrimSpace(content),
+		reasoningName:  name,
+		reasoningState: state,
+		collapsed:      collapsed,
+	})
+}
+
 func (m *model) upsertDisplayBlock(key string, block displayBlock) {
 	if idx, ok := m.blockIndexes[key]; ok && idx >= 0 && idx < len(m.blocks) {
 		m.blocks[idx] = block
@@ -1604,9 +1816,14 @@ func (m *model) renderBlocks() string {
 		header := block.header
 		if block.kind == displayBlockTool {
 			header = m.renderToolStatus(block)
+		} else if block.kind == displayBlockReasoning {
+			header = m.renderReasoningStatus(block)
 		}
 		out = append(out, prefix+header)
 		content := strings.TrimSpace(block.content)
+		if block.kind == displayBlockReasoning && block.collapsed {
+			content = ""
+		}
 		if content != "" {
 			wrapWidth := m.viewport.Width - 4
 			if wrapWidth < 1 {
@@ -1714,9 +1931,68 @@ func toolStatusText(block displayBlock) string {
 	return marker + " " + name
 }
 
+func (m *model) renderReasoningStatus(block displayBlock) string {
+	name := reasoningBlockName(block)
+	switch block.reasoningState {
+	case reasoningDisplaySucceeded:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render(reasoningDisclosure(block) + " ✓ " + name + reasoningSizeSuffix(block.content))
+	case reasoningDisplayIncomplete:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Render(reasoningDisclosure(block) + " ! " + name + reasoningSizeSuffix(block.content))
+	default:
+		return m.spinner.View() + " " + name
+	}
+}
+
+func reasoningDisclosure(block displayBlock) string {
+	if block.collapsed {
+		return "▸"
+	}
+	return "▾"
+}
+
+func reasoningSizeSuffix(content string) string {
+	count := utf8.RuneCountInString(strings.TrimSpace(content))
+	if count == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" · %d chars", count)
+}
+
+func reasoningStatusText(block displayBlock) string {
+	name := reasoningBlockName(block)
+	marker := "…"
+	switch block.reasoningState {
+	case reasoningDisplaySucceeded:
+		marker = "✓"
+	case reasoningDisplayIncomplete:
+		marker = "!"
+	}
+	return marker + " " + name
+}
+
+func reasoningBlockName(block displayBlock) string {
+	name := cleanDisplayName(block.reasoningName)
+	if name == "" {
+		return "Thinking"
+	}
+	return name
+}
+
 func (m *model) hasRunningTools() bool {
 	for _, block := range m.blocks {
 		if block.kind == displayBlockTool && block.toolState == toolDisplayRunning {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *model) hasRunningActivities() bool {
+	if m.hasRunningTools() {
+		return true
+	}
+	for _, block := range m.blocks {
+		if block.kind == displayBlockReasoning && block.reasoningState == reasoningDisplayRunning {
 			return true
 		}
 	}
@@ -1744,25 +2020,125 @@ func (m *model) clearActiveText(id string) {
 	}
 }
 
-func (m *model) resolveReasoningID(id string, start bool) string {
-	id = strings.TrimSpace(id)
-	if id != "" {
-		if start {
-			m.activeReasonID = id
-		}
-		return id
+func (m *model) startReasoningPart(event agui.EventEnvelope, fallbackName string, outer bool) {
+	id := strings.TrimSpace(event.MessageID)
+	if id != "" && m.replay.shouldIgnoreReasoning(id) {
+		return
 	}
-	if start || m.activeReasonID == "" {
+	if id == "" && !outer {
+		id = m.activeReasonID
+	}
+	if id == "" {
 		m.reasonCounter++
-		m.activeReasonID = fmt.Sprintf("reasoning-%d", m.reasonCounter)
+		id = fmt.Sprintf("reasoning-%d", m.reasonCounter)
 	}
-	return m.activeReasonID
+
+	part, ok := m.reasoningBuffer[id]
+	if !ok {
+		part = &reasoningPartBuffer{name: fallbackName}
+		m.reasoningBuffer[id] = part
+	}
+	if title := cleanDisplayName(valueString(event.Raw, "title")); title != "" {
+		part.name = title
+	} else if part.name == "" {
+		part.name = fallbackName
+	}
+	if outer {
+		part.outerActive = true
+	}
+	m.activeReasonID = id
+	m.upsertReasoningBlock(id, part.name, m.replay.filterReasoningReplayText(part.content.String()), reasoningDisplayRunning)
 }
 
-func (m *model) clearActiveReasoning(id string) {
+func (m *model) appendReasoningContent(event agui.EventEnvelope, fallbackName string) {
+	id := strings.TrimSpace(event.MessageID)
+	if id != "" && m.replay.isIgnoringReasoning(id) {
+		return
+	}
+	if id == "" {
+		id = m.activeReasonID
+	}
+	if id == "" {
+		m.reasonCounter++
+		id = fmt.Sprintf("reasoning-%d", m.reasonCounter)
+	}
+
+	part, ok := m.reasoningBuffer[id]
+	if !ok {
+		part = &reasoningPartBuffer{name: fallbackName}
+		m.reasoningBuffer[id] = part
+	}
+	if part.name == "" {
+		part.name = fallbackName
+	}
+	m.activeReasonID = id
+	part.content.WriteString(event.Delta)
+	m.upsertReasoningBlock(id, part.name, m.replay.filterReasoningReplayText(part.content.String()), reasoningDisplayRunning)
+}
+
+func (m *model) endReasoningPart(event agui.EventEnvelope, outer bool) {
+	id := strings.TrimSpace(event.MessageID)
+	if id != "" && m.replay.finishIgnoredReasoning(id) {
+		return
+	}
+	if id == "" {
+		id = m.activeReasonID
+	}
+	if id == "" {
+		return
+	}
+	part, ok := m.reasoningBuffer[id]
+	if !ok {
+		return
+	}
+
+	if outer {
+		part.outerActive = false
+		m.finalizeReasoningPart(id, reasoningDisplaySucceeded)
+		return
+	}
+	if !part.outerActive {
+		m.finalizeReasoningPart(id, reasoningDisplaySucceeded)
+	}
+}
+
+func (m *model) finalizeReasoningPart(id string, state reasoningDisplayState) {
+	part, ok := m.reasoningBuffer[id]
+	if !ok {
+		return
+	}
+	text := strings.TrimSpace(m.replay.filterReasoningReplayText(part.content.String()))
+	if text == "" {
+		m.removeBlock(reasoningBlockKey(id))
+	} else {
+		m.upsertReasoningBlock(id, part.name, text, state)
+		m.recordReasoningHistory(id, part.name, text)
+	}
+	delete(m.reasoningBuffer, id)
 	if m.activeReasonID == id {
 		m.activeReasonID = ""
 	}
+}
+
+func (m *model) recordReasoningHistory(id, name, text string) {
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	m.replay.addCompletedReasoning(id)
+	for index := range m.history {
+		message := &m.history[index]
+		if agui.NormalizeRole(message.Role) == agui.RoleReasoning && message.ID == id {
+			message.Content = text
+			message.Name = name
+			return
+		}
+	}
+	m.history = append(m.history, agui.ChatMessage{
+		Role:    agui.RoleReasoning,
+		Content: text,
+		ID:      id,
+		Name:    name,
+	})
 }
 
 func (m *model) resolveToolID(id string) string {
@@ -1780,15 +2156,6 @@ func (m *model) ensureTextBuffer(id string) *strings.Builder {
 	}
 	buf := &strings.Builder{}
 	m.textBuffers[id] = buf
-	return buf
-}
-
-func (m *model) ensureReasoningBuffer(id string) *strings.Builder {
-	if buf, ok := m.reasoningBuffer[id]; ok {
-		return buf
-	}
-	buf := &strings.Builder{}
-	m.reasoningBuffer[id] = buf
 	return buf
 }
 
@@ -1841,25 +2208,11 @@ func (m *model) finalizeRun() {
 	m.activeTextID = ""
 
 	// Flush reasoning
-	for id, buf := range m.reasoningBuffer {
-		reasoning := strings.TrimSpace(m.replay.filterReplayText(buf.String()))
-		if reasoning == "" {
-			m.removeBlock(reasoningBlockKey(id))
-		} else {
-			m.upsertBlock(reasoningBlockKey(id), eventHeader("REASONING", id), reasoning)
-		}
+	for id := range m.reasoningBuffer {
+		m.finalizeReasoningPart(id, reasoningDisplayIncomplete)
 	}
-	m.reasoningBuffer = map[string]*strings.Builder{}
+	m.reasoningBuffer = map[string]*reasoningPartBuffer{}
 	m.activeReasonID = ""
-
-	// Flush thinking
-	thinking := strings.TrimSpace(m.thinkingBuffer.String())
-	if thinking == "" {
-		m.removeBlock("thinking")
-	} else {
-		m.upsertBlock("thinking", "[THINKING]", thinking)
-	}
-	m.thinkingBuffer.Reset()
 
 	for toolID, buf := range m.toolBuffers {
 		if !buf.complete {
@@ -2012,10 +2365,9 @@ func (m *model) resetRunBuffers() {
 	m.textBuffers = map[string]*strings.Builder{}
 	m.textAgentNames = map[string]string{}
 	m.activeTextID = ""
-	m.reasoningBuffer = map[string]*strings.Builder{}
+	m.reasoningBuffer = map[string]*reasoningPartBuffer{}
 	m.activeReasonID = ""
 	m.toolBuffers = map[string]*toolCallBuffer{}
-	m.thinkingBuffer.Reset()
 }
 
 func (m *model) handleLeftClick(screenY int) {
@@ -2025,6 +2377,15 @@ func (m *model) handleLeftClick(screenY int) {
 	contentLine := screenY - viewportTop + m.viewport.YOffset
 	if contentLine >= 0 && contentLine < len(m.lineToBlock) {
 		m.selectedBlockIdx = m.lineToBlock[contentLine]
+		block := m.blocks[m.selectedBlockIdx]
+		if block.kind == displayBlockReasoning && block.reasoningState != reasoningDisplayRunning {
+			name := reasoningBlockName(block)
+			if block.collapsed {
+				m.status = fmt.Sprintf("%s selected; Ctrl+E to expand", name)
+			} else {
+				m.status = fmt.Sprintf("%s selected; Ctrl+E to collapse", name)
+			}
+		}
 	} else {
 		m.selectedBlockIdx = -1
 	}
@@ -2259,6 +2620,29 @@ func (m *model) copyCurrentSelection() {
 	m.copySelectedBlock()
 }
 
+func (m *model) toggleSelectedReasoning() {
+	if m.selectedBlockIdx < 0 || m.selectedBlockIdx >= len(m.blocks) {
+		m.status = "Select a completed thinking block first"
+		return
+	}
+	block := &m.blocks[m.selectedBlockIdx]
+	if block.kind != displayBlockReasoning {
+		m.status = "Selected block is not a thinking block"
+		return
+	}
+	if block.reasoningState == reasoningDisplayRunning {
+		m.status = fmt.Sprintf("%s is still running", reasoningBlockName(*block))
+		return
+	}
+	block.collapsed = !block.collapsed
+	name := reasoningBlockName(*block)
+	if block.collapsed {
+		m.status = fmt.Sprintf("%s collapsed", name)
+	} else {
+		m.status = fmt.Sprintf("%s expanded", name)
+	}
+}
+
 func (m *model) copySelectionAt(screenY int) {
 	if m.selection.active {
 		m.copyTextSelection()
@@ -2290,6 +2674,8 @@ func (m *model) copySelectedBlock() {
 	text := block.header
 	if block.kind == displayBlockTool {
 		text = toolStatusText(block)
+	} else if block.kind == displayBlockReasoning {
+		text = reasoningStatusText(block)
 	}
 	if content := strings.TrimSpace(block.content); content != "" {
 		text += "\n" + content
@@ -2385,6 +2771,8 @@ func newReplayState(history []agui.ChatMessage) replayState {
 		historicalIDs:          map[string]struct{}{},
 		ignoredTextMessageIDs:  map[string]struct{}{},
 		completedTextMessageID: map[string]struct{}{},
+		ignoredReasoningIDs:    map[string]struct{}{},
+		completedReasoningIDs:  map[string]struct{}{},
 	}
 	state.addHistoricalMessages(history)
 	return state
@@ -2400,33 +2788,95 @@ func (s *replayState) addHistoricalMessages(messages []agui.ChatMessage) {
 	if s.completedTextMessageID == nil {
 		s.completedTextMessageID = map[string]struct{}{}
 	}
+	if s.ignoredReasoningIDs == nil {
+		s.ignoredReasoningIDs = map[string]struct{}{}
+	}
+	if s.completedReasoningIDs == nil {
+		s.completedReasoningIDs = map[string]struct{}{}
+	}
 	knownTexts := make(map[string]struct{}, len(s.historicalTexts))
 	for _, text := range s.historicalTexts {
 		knownTexts[text] = struct{}{}
 	}
+	knownReasoning := make(map[string]struct{}, len(s.historicalReasoning))
+	for _, text := range s.historicalReasoning {
+		knownReasoning[text] = struct{}{}
+	}
 	for _, message := range messages {
-		if agui.NormalizeRole(message.Role) != agui.RoleAssistant {
-			continue
-		}
-		if message.ID != "" {
-			s.historicalIDs[normalizeHistoricalTextMessageID(message.ID)] = struct{}{}
-		}
-		if text := normalizeReplayText(messageText(message.Content)); text != "" {
-			if _, exists := knownTexts[text]; exists {
-				continue
+		switch agui.NormalizeRole(message.Role) {
+		case agui.RoleAssistant:
+			if message.ID != "" {
+				s.historicalIDs[normalizeHistoricalTextMessageID(message.ID)] = struct{}{}
 			}
-			s.historicalTexts = append(s.historicalTexts, text)
-			knownTexts[text] = struct{}{}
+			if text := normalizeReplayText(messageText(message.Content)); text != "" {
+				if _, exists := knownTexts[text]; exists {
+					continue
+				}
+				s.historicalTexts = append(s.historicalTexts, text)
+				knownTexts[text] = struct{}{}
+			}
+		case agui.RoleReasoning:
+			if message.ID != "" {
+				s.completedReasoningIDs[message.ID] = struct{}{}
+			}
+			if text := normalizeReplayText(messageText(message.Content)); text != "" {
+				if _, exists := knownReasoning[text]; exists {
+					continue
+				}
+				s.historicalReasoning = append(s.historicalReasoning, text)
+				knownReasoning[text] = struct{}{}
+			}
 		}
 	}
 }
 
 func (s replayState) filterReplayText(text string) string {
+	return filterHistoricalText(text, s.historicalTexts)
+}
+
+func (s replayState) filterReasoningReplayText(text string) string {
+	return filterHistoricalText(text, s.historicalReasoning)
+}
+
+func (s *replayState) shouldIgnoreReasoning(id string) bool {
+	if id == "" {
+		return false
+	}
+	if _, exists := s.completedReasoningIDs[id]; !exists {
+		return false
+	}
+	s.ignoredReasoningIDs[id] = struct{}{}
+	return true
+}
+
+func (s replayState) isIgnoringReasoning(id string) bool {
+	_, exists := s.ignoredReasoningIDs[id]
+	return exists
+}
+
+func (s *replayState) finishIgnoredReasoning(id string) bool {
+	if _, exists := s.ignoredReasoningIDs[id]; !exists {
+		return false
+	}
+	delete(s.ignoredReasoningIDs, id)
+	return true
+}
+
+func (s *replayState) addCompletedReasoning(id string) {
+	if s.completedReasoningIDs == nil {
+		s.completedReasoningIDs = map[string]struct{}{}
+	}
+	if id != "" {
+		s.completedReasoningIDs[id] = struct{}{}
+	}
+}
+
+func filterHistoricalText(text string, historicalTexts []string) string {
 	normalized := normalizeReplayText(text)
 	if normalized == "" {
 		return ""
 	}
-	for _, historicalText := range s.historicalTexts {
+	for _, historicalText := range historicalTexts {
 		if historicalText == "" {
 			continue
 		}
